@@ -1,6 +1,22 @@
 """
-Telegram Signal Bot - Yahoo Finance Version
-Uses latest yfinance with curl_cffi for better rate limit handling
+Telegram Signal Bot - Long & Short Signals
+Gold (XAUUSD), Crude Oil (CL=F), BTC, ETH
+
+LONG Entry Conditions:
+  1. Price > EMA200 on H4
+  2. Price > EMA200 on H1
+  3. Price > EMA200 on M5
+  4. EMA9 > EMA200 on M5
+  5. Price > EMA9 on M5
+  6. MACD line crosses Signal line from BELOW, both < 0
+
+SHORT Entry Conditions:
+  1. Price < EMA200 on H4
+  2. Price < EMA200 on H1
+  3. Price < EMA200 on M5
+  4. EMA9 < EMA200 on M5
+  5. Price < EMA9 on M5
+  6. MACD line crosses Signal line from ABOVE, both > 0
 """
 
 import os
@@ -8,17 +24,7 @@ import logging
 import requests
 from datetime import datetime, timezone
 import time
-import json
-
-# Try to import curl_cffi for better rate limit handling
-try:
-    from curl_cffi import requests as curl_requests
-    USE_CURL_CFFI = True
-    logging.info("Using curl_cffi for better rate limit handling")
-except ImportError:
-    import requests as curl_requests
-    USE_CURL_CFFI = False
-    logging.info("curl_cffi not available, using standard requests")
+import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -28,97 +34,31 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 COOLDOWN_FILE = "/tmp/last_signal.txt"
-CACHE_FILE = "/tmp/price_cache.json"
-SIGNAL_COOLDOWN = 3600  # 1 hour between signals
-CACHE_DURATION = 240  # Cache prices for 4 minutes
+SIGNAL_COOLDOWN = 3600  # 1 hour between signals per asset
 
-# Yahoo Finance symbols (updated working symbols)
+# Yahoo Finance symbols
 ASSETS = {
     "XAUUSD (Gold)": {
-        "type": "forex",
         "symbol": "XAUUSD=X",
         "fallback": "GC=F",
         "emoji": "🥇"
     },
     "Crude Oil WTI": {
-        "type": "commodity", 
         "symbol": "CL=F",
         "fallback": "BZ=F",
         "emoji": "🛢️"
     },
     "Bitcoin": {
-        "type": "crypto",
         "symbol": "BTC-USD",
+        "fallback": None,
         "emoji": "₿"
     },
     "Ethereum": {
-        "type": "crypto",
         "symbol": "ETH-USD",
+        "fallback": None,
         "emoji": "Ξ"
     }
 }
-
-# Create a session with browser impersonation (bypasses rate limits)
-def create_session():
-    """Create a session that mimics a real browser"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Origin': 'https://finance.yahoo.com',
-        'Referer': 'https://finance.yahoo.com/'
-    }
-    
-    if USE_CURL_CFFI:
-        try:
-            session = curl_requests.Session(impersonate="chrome120")
-            session.headers.update(headers)
-            return session
-        except:
-            pass
-    
-    session = requests.Session()
-    session.headers.update(headers)
-    return session
-
-# Global session
-YF_SESSION = create_session()
-
-# Import yfinance with custom session
-import yfinance as yf
-yf.set_config(proxy=None)
-
-# ============ CACHE FUNCTIONS ============
-def get_cached_price(asset_name):
-    """Get price from cache if still valid"""
-    try:
-        with open(CACHE_FILE, 'r') as f:
-            cache = json.load(f)
-            timestamp = cache.get('timestamp', 0)
-            if (datetime.now(timezone.utc).timestamp() - timestamp) < CACHE_DURATION:
-                return cache.get(asset_name)
-    except:
-        pass
-    return None
-
-def save_to_cache(asset_name, price):
-    """Save price to cache"""
-    try:
-        cache = {}
-        try:
-            with open(CACHE_FILE, 'r') as f:
-                cache = json.load(f)
-        except:
-            pass
-        
-        cache[asset_name] = price
-        cache['timestamp'] = datetime.now(timezone.utc).timestamp()
-        
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(cache, f)
-    except:
-        pass
 
 # ============ COOLDOWN FUNCTIONS ============
 def check_cooldown(asset):
@@ -140,163 +80,227 @@ def save_cooldown(asset):
     except:
         pass
 
-# ============ YAHOO FINANCE DATA (with fallback and retry) ============
-def fetch_yahoo_data(symbol, retry_count=3):
-    """Fetch current price from Yahoo Finance with retry and fallback"""
-    
-    for attempt in range(retry_count):
-        try:
-            ticker = yf.Ticker(symbol, session=YF_SESSION)
-            
-            # Try to get current price via fast_info first (faster, less likely to rate limit)
-            try:
-                fast_info = ticker.fast_info
-                if hasattr(fast_info, 'last_price') and fast_info.last_price:
-                    price = float(fast_info.last_price)
-                    if price > 0:
-                        return price
-            except:
-                pass
-            
-            # Fallback to history
-            hist = ticker.history(period="1d", interval="1m", timeout=15)
-            
-            if not hist.empty:
-                price = float(hist['Close'].iloc[-1])
-                if price > 0:
-                    return price
-            
-            # Try history with longer period
-            hist = ticker.history(period="5d", interval="5m", timeout=15)
-            if not hist.empty:
-                price = float(hist['Close'].iloc[-1])
-                if price > 0:
-                    return price
-            
-        except Exception as e:
-            error_msg = str(e)
-            if "Rate limited" in error_msg or "Too Many Requests" in error_msg:
-                log.warning(f"Rate limit hit for {symbol}, waiting...")
-                time.sleep(3)
-            else:
-                log.debug(f"Attempt {attempt+1} failed for {symbol}: {e}")
+# ============ YAHOO FINANCE DATA FETCHING ============
+def fetch_yahoo_data(symbol, interval, period="5d"):
+    """Fetch OHLCV data from Yahoo Finance"""
+    try:
+        import yfinance as yf
         
-        if attempt < retry_count - 1:
-            time.sleep(2)
+        # Add browser headers to avoid rate limiting
+        ticker = yf.Ticker(symbol)
+        
+        # Download data
+        df = ticker.history(period=period, interval=interval, progress=False)
+        
+        if df is not None and not df.empty:
+            return df
     
-    return 0
+    except Exception as e:
+        log.error(f"Error fetching {symbol} @ {interval}: {e}")
+    
+    return None
 
-def get_asset_price(asset_name, asset_config):
-    """Get price for an asset with caching and fallback"""
-    
-    # Check cache first
-    cached = get_cached_price(asset_name)
-    if cached:
-        log.debug(f"Using cached price for {asset_name}: ${cached:,.2f}")
-        return cached
-    
+def fetch_with_fallback(asset_name, asset_config, interval, period="5d"):
+    """Try primary symbol first, then fallback"""
     # Try primary symbol
     symbol = asset_config["symbol"]
-    price = fetch_yahoo_data(symbol)
+    df = fetch_yahoo_data(symbol, interval, period)
     
-    # If primary fails and fallback exists, try fallback
-    if price == 0 and "fallback" in asset_config:
-        fallback = asset_config["fallback"]
-        log.info(f"Primary symbol {symbol} failed, trying fallback {fallback}")
-        price = fetch_yahoo_data(fallback)
+    if df is not None and not df.empty:
+        return df, symbol
     
-    if price > 0:
-        save_to_cache(asset_name, price)
-        return price
+    # Try fallback if available
+    fallback = asset_config.get("fallback")
+    if fallback:
+        log.info(f"Primary {symbol} failed for {asset_name}, trying fallback {fallback}")
+        df = fetch_yahoo_data(fallback, interval, period)
+        if df is not None and not df.empty:
+            return df, fallback
     
-    return 0
-
-def get_historical_data(symbol, period="1mo", interval="1d"):
-    """Get historical data for indicators"""
-    try:
-        ticker = yf.Ticker(symbol, session=YF_SESSION)
-        hist = ticker.history(period=period, interval=interval, timeout=15)
-        
-        if not hist.empty:
-            return hist['Close'].values.tolist()
-    except Exception as e:
-        log.debug(f"Historical data error for {symbol}: {e}")
-    
-    return []
+    return None, None
 
 # ============ TECHNICAL INDICATORS ============
-def calculate_sma(prices, period):
-    if len(prices) < period:
-        return None
-    return sum(prices[-period:]) / period
-
 def calculate_ema(prices, period):
-    """Exponential Moving Average"""
+    """Calculate Exponential Moving Average"""
     if len(prices) < period:
         return None
     
     multiplier = 2 / (period + 1)
-    ema = prices[-period]
+    ema = prices[0]
     
-    for price in prices[-period+1:]:
+    for price in prices[1:]:
         ema = (price - ema) * multiplier + ema
     
     return ema
 
-def generate_signal(name, asset_config, current_price):
-    """Generate BUY signal based on technical indicators"""
+def get_ema_series(prices, period):
+    """Get full EMA series for condition checking"""
+    if len(prices) < period:
+        return []
     
-    symbol = asset_config.get("symbol")
-    if not symbol:
+    ema_values = []
+    multiplier = 2 / (period + 1)
+    ema = prices[0]
+    
+    for price in prices:
+        ema = (price - ema) * multiplier + ema
+        ema_values.append(ema)
+    
+    return ema_values
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """Calculate MACD line and Signal line"""
+    if len(prices) < slow:
         return None, None
     
-    # Get historical data
-    historical = get_historical_data(symbol, period="2mo", interval="1d")
+    # Calculate EMAs
+    ema_fast_values = get_ema_series(prices, fast)
+    ema_slow_values = get_ema_series(prices, slow)
     
-    if not historical or len(historical) < 30 or current_price == 0:
+    if len(ema_fast_values) < slow or len(ema_slow_values) < slow:
         return None, None
     
-    # Calculate indicators
-    sma_20 = calculate_sma(historical, 20)
-    sma_50 = calculate_sma(historical, 50) if len(historical) >= 50 else None
-    ema_20 = calculate_ema(historical, 20)
+    # MACD Line = Fast EMA - Slow EMA
+    macd_line = [ema_fast_values[i] - ema_slow_values[i] for i in range(len(ema_slow_values))]
     
-    if sma_20 is None:
+    # Signal Line = EMA of MACD Line
+    signal_line = get_ema_series(macd_line, signal)
+    
+    if len(signal_line) < 2:
         return None, None
     
-    reasons = []
-    
-    # Buy signal: Price above SMA20 (momentum)
-    if current_price > sma_20:
-        reasons.append(f"Price (${current_price:,.2f}) > SMA20 (${sma_20:,.2f})")
-    
-    # Stronger signal: Golden cross setup
-    if sma_50 and current_price > sma_20 and current_price > sma_50:
-        reasons.append(f"Price above both SMA20 and SMA50 (${sma_50:,.2f})")
-    
-    # EMA confirmation
-    if ema_20 and current_price > ema_20:
-        reasons.append(f"Price above EMA20 (${ema_20:,.2f})")
-    
-    if reasons:
-        return "BUY", " | ".join(reasons[:2])
-    
-    return None, None
+    return macd_line, signal_line
 
-# ============ TELEGRAM ============
-def send_signal(name, signal_type, reason, price, emoji):
-    """Send trading signal to Telegram"""
+def check_conditions(prices_h4, prices_h1, prices_m5):
+    """Check all long and short conditions"""
     
-    message = f"""<b>🚀 {signal_type} SIGNAL — {emoji} {name}</b>
-
-<b>Price:</b> ${price:,.2f}
-<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
-
-<b>Signal Details:</b>
-{reason}
-
-<code>⚠️ Always use stop losses. Trade at your own risk.</code>"""
+    if len(prices_h4) < 200 or len(prices_h1) < 200 or len(prices_m5) < 200:
+        log.warning(f"Insufficient data: H4={len(prices_h4)}, H1={len(prices_h1)}, M5={len(prices_m5)}")
+        return {
+            "long": False, "long_details": {}, "short": False, "short_details": {}
+        }
     
+    # Calculate EMAs
+    ema200_h4 = calculate_ema(prices_h4, 200)
+    ema200_h1 = calculate_ema(prices_h1, 200)
+    ema200_m5 = calculate_ema(prices_m5, 200)
+    ema9_m5 = calculate_ema(prices_m5, 9)
+    
+    # Get last values (most recent closed bar)
+    close_h4 = prices_h4[-2] if len(prices_h4) >= 2 else prices_h4[-1]
+    close_h1 = prices_h1[-2] if len(prices_h1) >= 2 else prices_h1[-1]
+    close_m5 = prices_m5[-2] if len(prices_m5) >= 2 else prices_m5[-1]
+    
+    # MACD calculation
+    macd_line, signal_line = calculate_macd(prices_m5)
+    
+    # Initialize results
+    long_conditions = {}
+    short_conditions = {}
+    
+    # Condition 1,2,3: Price vs EMA200
+    if ema200_h4 is not None:
+        long_conditions["H4 Price > EMA200"] = close_h4 > ema200_h4
+        short_conditions["H4 Price < EMA200"] = close_h4 < ema200_h4
+    else:
+        long_conditions["H4 Price > EMA200"] = False
+        short_conditions["H4 Price < EMA200"] = False
+    
+    if ema200_h1 is not None:
+        long_conditions["H1 Price > EMA200"] = close_h1 > ema200_h1
+        short_conditions["H1 Price < EMA200"] = close_h1 < ema200_h1
+    else:
+        long_conditions["H1 Price > EMA200"] = False
+        short_conditions["H1 Price < EMA200"] = False
+    
+    if ema200_m5 is not None:
+        long_conditions["M5 Price > EMA200"] = close_m5 > ema200_m5
+        short_conditions["M5 Price < EMA200"] = close_m5 < ema200_m5
+    else:
+        long_conditions["M5 Price > EMA200"] = False
+        short_conditions["M5 Price < EMA200"] = False
+    
+    # Condition 4: EMA9 vs EMA200
+    if ema9_m5 is not None and ema200_m5 is not None:
+        long_conditions["EMA9 > EMA200"] = ema9_m5 > ema200_m5
+        short_conditions["EMA9 < EMA200"] = ema9_m5 < ema200_m5
+    else:
+        long_conditions["EMA9 > EMA200"] = False
+        short_conditions["EMA9 < EMA200"] = False
+    
+    # Condition 5: Price vs EMA9
+    if ema9_m5 is not None:
+        long_conditions["Price > EMA9"] = close_m5 > ema9_m5
+        short_conditions["Price < EMA9"] = close_m5 < ema9_m5
+    else:
+        long_conditions["Price > EMA9"] = False
+        short_conditions["Price < EMA9"] = False
+    
+    # Condition 6: MACD crossover
+    if macd_line is not None and signal_line is not None and len(macd_line) >= 3 and len(signal_line) >= 3:
+        macd_prev = macd_line[-3]
+        macd_curr = macd_line[-2]
+        signal_prev = signal_line[-3]
+        signal_curr = signal_line[-2]
+        
+        # Long: MACD crosses Signal from BELOW, both < 0
+        long_macd_cross = (macd_prev < signal_prev and macd_curr >= signal_curr)
+        long_macd_below_zero = (macd_curr < 0 and signal_curr < 0)
+        long_conditions["MACD cross below zero (Long)"] = long_macd_cross and long_macd_below_zero
+        
+        # Short: MACD crosses Signal from ABOVE, both > 0
+        short_macd_cross = (macd_prev > signal_prev and macd_curr <= signal_curr)
+        short_macd_above_zero = (macd_curr > 0 and signal_curr > 0)
+        short_conditions["MACD cross above zero (Short)"] = short_macd_cross and short_macd_above_zero
+    else:
+        long_conditions["MACD cross below zero (Long)"] = False
+        short_conditions["MACD cross above zero (Short)"] = False
+    
+    # Check if all conditions are met
+    long_signal = all(long_conditions.values())
+    short_signal = all(short_conditions.values())
+    
+    return {
+        "long": long_signal,
+        "long_details": long_conditions,
+        "short": short_signal,
+        "short_details": short_conditions,
+        "price": close_m5
+    }
+
+def get_asset_data(asset_name, asset_config):
+    """Fetch all required timeframes for an asset"""
+    try:
+        # Fetch H4 data (using 1h and resampling)
+        df_h1, used_symbol = fetch_with_fallback(asset_name, asset_config, "1h", "60d")
+        if df_h1 is None or df_h1.empty:
+            log.warning(f"Cannot fetch H1 data for {asset_name}")
+            return None, None, None
+        
+        prices_h1 = df_h1['Close'].values
+        
+        # Resample to H4 (every 4 hours)
+        num_h4 = len(prices_h1) // 4
+        prices_h4 = np.array([np.mean(prices_h1[i*4:(i+1)*4]) for i in range(num_h4)])
+        
+        # Fetch M5 data
+        df_m5, _ = fetch_with_fallback(asset_name, asset_config, "5m", "5d")
+        if df_m5 is None or df_m5.empty:
+            log.warning(f"Cannot fetch M5 data for {asset_name}")
+            return None, None, None
+        
+        prices_m5 = df_m5['Close'].values
+        
+        log.info(f"✅ {asset_name} - H4:{len(prices_h4)} bars, H1:{len(prices_h1)} bars, M5:{len(prices_m5)} bars")
+        
+        return prices_h4, prices_h1, prices_m5
+        
+    except Exception as e:
+        log.error(f"Error getting data for {asset_name}: {e}")
+        return None, None, None
+
+# ============ TELEGRAM FUNCTIONS ============
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={
@@ -305,56 +309,126 @@ def send_signal(name, signal_type, reason, price, emoji):
             "parse_mode": "HTML"
         }, timeout=10)
         r.raise_for_status()
-        log.info(f"✅ Signal sent for {name}")
+        log.info("✅ Telegram sent")
         return True
     except Exception as e:
         log.error(f"Telegram failed: {e}")
         return False
 
-# ============ MAIN ============
-def main():
-    log.info("=" * 50)
-    log.info("📊 SIGNAL BOT - YAHOO FINANCE VERSION")
-    log.info(f"curl_cffi available: {USE_CURL_CFFI}")
-    log.info(f"Monitoring {len(ASSETS)} assets")
-    log.info("=" * 50)
+def build_long_message(asset_name, emoji, price, conditions):
+    """Build long signal message"""
+    checkmarks = "✅ " * sum(conditions.values())
+    crosses = "❌ " * (len(conditions) - sum(conditions.values()))
     
-    signals_found = 0
+    message = f"""<b>🟢 LONG ENTRY SIGNAL — {emoji} {asset_name}</b>
+
+<b>Price:</b> ${price:,.2f}
+<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+<b>All 6 Conditions Met:</b>
+{chr(10).join([f"  {('✅' if v else '❌')} {k}" for k, v in conditions.items()])}
+
+<code>🚀 Consider LONG position with proper risk management
+📍 Stop loss below recent swing low
+🎯 Take profit at 2:1 risk/reward ratio</code>"""
+    
+    return message
+
+def build_short_message(asset_name, emoji, price, conditions):
+    """Build short signal message"""
+    message = f"""<b>🔴 SHORT ENTRY SIGNAL — {emoji} {asset_name}</b>
+
+<b>Price:</b> ${price:,.2f}
+<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+<b>All 6 Conditions Met:</b>
+{chr(10).join([f"  {('✅' if v else '❌')} {k}" for k, v in conditions.items()])}
+
+<code>📉 Consider SHORT position with proper risk management
+📍 Stop loss above recent swing high
+🎯 Take profit at 2:1 risk/reward ratio</code>"""
+    
+    return message
+
+# ============ MAIN FUNCTION ============
+def main():
+    log.info("=" * 60)
+    log.info("📊 TRADING SIGNAL BOT - LONG & SHORT SIGNALS")
+    log.info("=" * 60)
+    log.info(f"Monitoring: {', '.join(ASSETS.keys())}")
+    log.info("LONG: Price > EMA200 (H4/H1/M5) + EMA9 > EMA200 + Price > EMA9 + MACD crossover below 0")
+    log.info("SHORT: Price < EMA200 (H4/H1/M5) + EMA9 < EMA200 + Price < EMA9 + MACD crossover above 0")
+    log.info("=" * 60)
+    
+    signals_sent = 0
     
     for name, asset_config in ASSETS.items():
-        log.info(f"🔍 Checking {name}...")
+        log.info(f"\n🔍 Analyzing {name}...")
         
-        # Get current price (cached)
-        current_price = get_asset_price(name, asset_config)
+        # Get data for all timeframes
+        prices_h4, prices_h1, prices_m5 = get_asset_data(name, asset_config)
         
-        if current_price > 0:
-            log.info(f"💰 {name}: ${current_price:,.2f}")
+        if prices_h4 is None or len(prices_h4) < 50:
+            log.warning(f"⚠️ {name} - Insufficient H4 data (need 50+ bars)")
+            continue
+        
+        if prices_h1 is None or len(prices_h1) < 200:
+            log.warning(f"⚠️ {name} - Insufficient H1 data (need 200+ bars)")
+            continue
+        
+        if prices_m5 is None or len(prices_m5) < 200:
+            log.warning(f"⚠️ {name} - Insufficient M5 data (need 200+ bars)")
+            continue
+        
+        # Check all conditions
+        result = check_conditions(prices_h4, prices_h1, prices_m5)
+        current_price = result.get("price", 0)
+        
+        log.info(f"💰 Current Price: ${current_price:,.2f}")
+        
+        # Check for LONG signal
+        if result["long"]:
+            log.info(f"🟢 LONG signal detected for {name}!")
             
-            # Generate signal
-            signal_type, reason = generate_signal(name, asset_config, current_price)
-            
-            if signal_type and reason:
-                if not check_cooldown(name):
-                    if send_signal(name, signal_type, reason, current_price, asset_config["emoji"]):
-                        save_cooldown(name)
-                        signals_found += 1
-                        log.info(f"🔔 {signal_type} signal sent for {name}")
-                else:
-                    log.info(f"⏰ {name} - signal blocked (cooldown)")
+            if not check_cooldown(f"{name}_LONG"):
+                message = build_long_message(name, asset_config["emoji"], current_price, result["long_details"])
+                if send_telegram(message):
+                    save_cooldown(f"{name}_LONG")
+                    signals_sent += 1
+                    log.info(f"✅ LONG signal sent for {name}")
             else:
-                log.info(f"📊 {name} - no signal at this time")
+                log.info(f"⏰ {name} LONG - cooldown active")
         else:
-            log.warning(f"⚠️ {name} - price unavailable (retrying next cycle)")
+            # Log which conditions failed
+            failed = [k for k, v in result["long_details"].items() if not v]
+            if failed:
+                log.info(f"📊 {name} LONG - missing: {', '.join(failed[:3])}")
+            else:
+                log.info(f"📊 {name} - no LONG signal")
+        
+        # Check for SHORT signal
+        if result["short"]:
+            log.info(f"🔴 SHORT signal detected for {name}!")
+            
+            if not check_cooldown(f"{name}_SHORT"):
+                message = build_short_message(name, asset_config["emoji"], current_price, result["short_details"])
+                if send_telegram(message):
+                    save_cooldown(f"{name}_SHORT")
+                    signals_sent += 1
+                    log.info(f"✅ SHORT signal sent for {name}")
+            else:
+                log.info(f"⏰ {name} SHORT - cooldown active")
+        else:
+            # Log which conditions failed
+            failed = [k for k, v in result["short_details"].items() if not v]
+            if failed:
+                log.info(f"📊 {name} SHORT - missing: {', '.join(failed[:3])}")
         
         # Delay between assets to avoid rate limits
         time.sleep(3)
     
-    if signals_found > 0:
-        log.info(f"✅ Sent {signals_found} signal(s) this cycle")
-    else:
-        log.info("✅ No signals this cycle")
-    
-    log.info("=" * 50)
+    log.info(f"\n✅ Cycle complete. Sent {signals_sent} signal(s).")
+    log.info("=" * 60)
 
 if __name__ == "__main__":
     main()
