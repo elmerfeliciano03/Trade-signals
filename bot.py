@@ -1,5 +1,6 @@
 """
-Telegram Signal Bot - SIGNALS ONLY (With Retry Logic)
+Telegram Signal Bot - Yahoo Finance Version
+Uses latest yfinance with curl_cffi for better rate limit handling
 """
 
 import os
@@ -7,6 +8,17 @@ import logging
 import requests
 from datetime import datetime, timezone
 import time
+import json
+
+# Try to import curl_cffi for better rate limit handling
+try:
+    from curl_cffi import requests as curl_requests
+    USE_CURL_CFFI = True
+    logging.info("Using curl_cffi for better rate limit handling")
+except ImportError:
+    import requests as curl_requests
+    USE_CURL_CFFI = False
+    logging.info("curl_cffi not available, using standard requests")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -14,34 +26,99 @@ log = logging.getLogger(__name__)
 # ============ CONFIGURATION ============
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "")
 
 COOLDOWN_FILE = "/tmp/last_signal.txt"
-SIGNAL_COOLDOWN = 3600  # 1 hour between signals per asset
+CACHE_FILE = "/tmp/price_cache.json"
+SIGNAL_COOLDOWN = 3600  # 1 hour between signals
+CACHE_DURATION = 240  # Cache prices for 4 minutes
 
+# Yahoo Finance symbols (updated working symbols)
 ASSETS = {
     "XAUUSD (Gold)": {
         "type": "forex",
-        "from": "XAU",
-        "to": "USD",
+        "symbol": "XAUUSD=X",
+        "fallback": "GC=F",
         "emoji": "🥇"
     },
     "Crude Oil WTI": {
-        "type": "commodity",
-        "symbol": "WTI",
+        "type": "commodity", 
+        "symbol": "CL=F",
+        "fallback": "BZ=F",
         "emoji": "🛢️"
     },
     "Bitcoin": {
         "type": "crypto",
-        "id": "bitcoin",
+        "symbol": "BTC-USD",
         "emoji": "₿"
     },
     "Ethereum": {
         "type": "crypto",
-        "id": "ethereum",
+        "symbol": "ETH-USD",
         "emoji": "Ξ"
     }
 }
+
+# Create a session with browser impersonation (bypasses rate limits)
+def create_session():
+    """Create a session that mimics a real browser"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Origin': 'https://finance.yahoo.com',
+        'Referer': 'https://finance.yahoo.com/'
+    }
+    
+    if USE_CURL_CFFI:
+        try:
+            session = curl_requests.Session(impersonate="chrome120")
+            session.headers.update(headers)
+            return session
+        except:
+            pass
+    
+    session = requests.Session()
+    session.headers.update(headers)
+    return session
+
+# Global session
+YF_SESSION = create_session()
+
+# Import yfinance with custom session
+import yfinance as yf
+yf.set_config(proxy=None)
+
+# ============ CACHE FUNCTIONS ============
+def get_cached_price(asset_name):
+    """Get price from cache if still valid"""
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            cache = json.load(f)
+            timestamp = cache.get('timestamp', 0)
+            if (datetime.now(timezone.utc).timestamp() - timestamp) < CACHE_DURATION:
+                return cache.get(asset_name)
+    except:
+        pass
+    return None
+
+def save_to_cache(asset_name, price):
+    """Save price to cache"""
+    try:
+        cache = {}
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                cache = json.load(f)
+        except:
+            pass
+        
+        cache[asset_name] = price
+        cache['timestamp'] = datetime.now(timezone.utc).timestamp()
+        
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(cache, f)
+    except:
+        pass
 
 # ============ COOLDOWN FUNCTIONS ============
 def check_cooldown(asset):
@@ -63,119 +140,88 @@ def save_cooldown(asset):
     except:
         pass
 
-# ============ ALPHA VANTAGE (Gold & Oil) ============
-def get_alpha_vantage_price(symbol, asset_type):
-    """Get current price with retry logic"""
-    for attempt in range(3):  # Try 3 times
+# ============ YAHOO FINANCE DATA (with fallback and retry) ============
+def fetch_yahoo_data(symbol, retry_count=3):
+    """Fetch current price from Yahoo Finance with retry and fallback"""
+    
+    for attempt in range(retry_count):
         try:
-            if asset_type == "forex":
-                params = {
-                    "function": "CURRENCY_EXCHANGE_RATE",
-                    "from_currency": "XAU",
-                    "to_currency": "USD",
-                    "apikey": ALPHA_VANTAGE_KEY
-                }
-            else:
-                params = {
-                    "function": "CRUDE_OIL_INTRADAY",
-                    "symbol": symbol,
-                    "interval": "5min",
-                    "apikey": ALPHA_VANTAGE_KEY
-                }
+            ticker = yf.Ticker(symbol, session=YF_SESSION)
             
-            url = "https://www.alphavantage.co/query"
-            r = requests.get(url, params=params, timeout=10)
+            # Try to get current price via fast_info first (faster, less likely to rate limit)
+            try:
+                fast_info = ticker.fast_info
+                if hasattr(fast_info, 'last_price') and fast_info.last_price:
+                    price = float(fast_info.last_price)
+                    if price > 0:
+                        return price
+            except:
+                pass
             
-            if r.status_code == 200:
-                data = r.json()
-                
-                if asset_type == "forex":
-                    rate = data.get("Realtime Currency Exchange Rate", {}).get("5. Exchange Rate", "")
-                    if rate:
-                        return float(rate)
-                else:
-                    time_series = data.get("Time Series (5min)", {})
-                    if time_series:
-                        latest = list(time_series.values())[0]
-                        return float(latest.get("4. close", 0))
+            # Fallback to history
+            hist = ticker.history(period="1d", interval="1m", timeout=15)
             
-            # If we hit rate limit, wait before retry
-            if "Note" in str(data) or "rate limit" in str(data).lower():
-                log.warning(f"Rate limit hit for {symbol}, waiting...")
-                time.sleep(2)
-                
+            if not hist.empty:
+                price = float(hist['Close'].iloc[-1])
+                if price > 0:
+                    return price
+            
+            # Try history with longer period
+            hist = ticker.history(period="5d", interval="5m", timeout=15)
+            if not hist.empty:
+                price = float(hist['Close'].iloc[-1])
+                if price > 0:
+                    return price
+            
         except Exception as e:
-            log.error(f"Alpha Vantage error (attempt {attempt+1}): {e}")
-            time.sleep(1)
+            error_msg = str(e)
+            if "Rate limited" in error_msg or "Too Many Requests" in error_msg:
+                log.warning(f"Rate limit hit for {symbol}, waiting...")
+                time.sleep(3)
+            else:
+                log.debug(f"Attempt {attempt+1} failed for {symbol}: {e}")
+        
+        if attempt < retry_count - 1:
+            time.sleep(2)
     
     return 0
 
-def get_alpha_vantage_historical(symbol, asset_type):
-    """Get historical data with retry"""
-    for attempt in range(2):
-        try:
-            if asset_type == "forex":
-                params = {
-                    "function": "FX_DAILY",
-                    "from_symbol": "XAU",
-                    "to_symbol": "USD",
-                    "outputsize": "compact",
-                    "apikey": ALPHA_VANTAGE_KEY
-                }
-            else:
-                params = {
-                    "function": "CRUDE_OIL_INTRADAY",
-                    "symbol": symbol,
-                    "interval": "daily",
-                    "outputsize": "compact",
-                    "apikey": ALPHA_VANTAGE_KEY
-                }
-            
-            url = "https://www.alphavantage.co/query"
-            r = requests.get(url, params=params, timeout=10)
-            
-            if r.status_code == 200:
-                data = r.json()
-                time_series = data.get("Time Series FX (Daily)", {}) or data.get("Time Series (Daily)", {})
-                prices = []
-                for date in sorted(time_series.keys())[-60:]:  # Last 60 days
-                    prices.append(float(time_series[date]["4. close"]))
-                if prices:
-                    return prices
-        except:
-            pass
-        time.sleep(1)
-    return []
-
-# ============ COINGECKO (Crypto) ============
-def get_crypto_price(crypto_id):
-    """Get crypto price with retry"""
-    for attempt in range(3):
-        try:
-            url = "https://api.coingecko.com/api/v3/simple/price"
-            params = {"ids": crypto_id, "vs_currencies": "usd"}
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                price = data.get(crypto_id, {}).get("usd", 0)
-                if price > 0:
-                    return price
-        except Exception as e:
-            log.error(f"CoinGecko error for {crypto_id} (attempt {attempt+1}): {e}")
-        time.sleep(1)
+def get_asset_price(asset_name, asset_config):
+    """Get price for an asset with caching and fallback"""
+    
+    # Check cache first
+    cached = get_cached_price(asset_name)
+    if cached:
+        log.debug(f"Using cached price for {asset_name}: ${cached:,.2f}")
+        return cached
+    
+    # Try primary symbol
+    symbol = asset_config["symbol"]
+    price = fetch_yahoo_data(symbol)
+    
+    # If primary fails and fallback exists, try fallback
+    if price == 0 and "fallback" in asset_config:
+        fallback = asset_config["fallback"]
+        log.info(f"Primary symbol {symbol} failed, trying fallback {fallback}")
+        price = fetch_yahoo_data(fallback)
+    
+    if price > 0:
+        save_to_cache(asset_name, price)
+        return price
+    
     return 0
 
-def get_crypto_historical(crypto_id, days=30):
-    """Get crypto historical data"""
+def get_historical_data(symbol, period="1mo", interval="1d"):
+    """Get historical data for indicators"""
     try:
-        url = f"https://api.coingecko.com/api/v3/coins/{crypto_id}/market_chart"
-        params = {"vs_currency": "usd", "days": days, "interval": "daily"}
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            prices = r.json().get("prices", [])
-            return [p[1] for p in prices]
+        ticker = yf.Ticker(symbol, session=YF_SESSION)
+        hist = ticker.history(period=period, interval=interval, timeout=15)
+        
+        if not hist.empty:
+            return hist['Close'].values.tolist()
     except Exception as e:
-        log.error(f"Crypto historical error for {crypto_id}: {e}")
+        log.debug(f"Historical data error for {symbol}: {e}")
+    
     return []
 
 # ============ TECHNICAL INDICATORS ============
@@ -184,39 +230,72 @@ def calculate_sma(prices, period):
         return None
     return sum(prices[-period:]) / period
 
-def generate_signal(name, asset_config, current_price, historical):
-    """Generate BUY signal based on SMA crossover"""
-    if not historical or len(historical) < 20 or current_price == 0:
+def calculate_ema(prices, period):
+    """Exponential Moving Average"""
+    if len(prices) < period:
+        return None
+    
+    multiplier = 2 / (period + 1)
+    ema = prices[-period]
+    
+    for price in prices[-period+1:]:
+        ema = (price - ema) * multiplier + ema
+    
+    return ema
+
+def generate_signal(name, asset_config, current_price):
+    """Generate BUY signal based on technical indicators"""
+    
+    symbol = asset_config.get("symbol")
+    if not symbol:
         return None, None
     
+    # Get historical data
+    historical = get_historical_data(symbol, period="2mo", interval="1d")
+    
+    if not historical or len(historical) < 30 or current_price == 0:
+        return None, None
+    
+    # Calculate indicators
     sma_20 = calculate_sma(historical, 20)
     sma_50 = calculate_sma(historical, 50) if len(historical) >= 50 else None
+    ema_20 = calculate_ema(historical, 20)
     
     if sma_20 is None:
         return None, None
     
-    # Buy signal: Price above SMA20 (simpler condition)
-    if current_price > sma_20:
-        # Check if it just crossed above
-        if historical[-2] <= sma_20:
-            return "BUY", f"Price crossed above SMA20 (${sma_20:.2f})"
+    reasons = []
     
-    # Stronger buy signal: Price above both SMAs
+    # Buy signal: Price above SMA20 (momentum)
+    if current_price > sma_20:
+        reasons.append(f"Price (${current_price:,.2f}) > SMA20 (${sma_20:,.2f})")
+    
+    # Stronger signal: Golden cross setup
     if sma_50 and current_price > sma_20 and current_price > sma_50:
-        if historical[-2] <= sma_20 or historical[-2] <= sma_50:
-            return "BUY", f"Price above SMA20 (${sma_20:.2f}) and SMA50 (${sma_50:.2f})"
+        reasons.append(f"Price above both SMA20 and SMA50 (${sma_50:,.2f})")
+    
+    # EMA confirmation
+    if ema_20 and current_price > ema_20:
+        reasons.append(f"Price above EMA20 (${ema_20:,.2f})")
+    
+    if reasons:
+        return "BUY", " | ".join(reasons[:2])
     
     return None, None
 
 # ============ TELEGRAM ============
 def send_signal(name, signal_type, reason, price, emoji):
-    """Send ONLY trading signals"""
-    message = f"""<b>🚀 {signal_type} — {emoji} {name}</b>
+    """Send trading signal to Telegram"""
+    
+    message = f"""<b>🚀 {signal_type} SIGNAL — {emoji} {name}</b>
 
 <b>Price:</b> ${price:,.2f}
 <b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
 
-<b>Signal:</b> {reason}"""
+<b>Signal Details:</b>
+{reason}
+
+<code>⚠️ Always use stop losses. Trade at your own risk.</code>"""
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -234,62 +313,48 @@ def send_signal(name, signal_type, reason, price, emoji):
 
 # ============ MAIN ============
 def main():
-    log.info("=" * 45)
-    log.info("📊 SIGNAL BOT - ACTIVE (With Retry Logic)")
+    log.info("=" * 50)
+    log.info("📊 SIGNAL BOT - YAHOO FINANCE VERSION")
+    log.info(f"curl_cffi available: {USE_CURL_CFFI}")
     log.info(f"Monitoring {len(ASSETS)} assets")
-    
-    # Check if Alpha Vantage key is set
-    if not ALPHA_VANTAGE_KEY:
-        log.warning("⚠️ ALPHA_VANTAGE_KEY not set! Gold/Oil will be unavailable.")
-        log.info("Get free key at: https://www.alphavantage.co/support/#api-key")
-    
-    log.info("=" * 45)
+    log.info("=" * 50)
     
     signals_found = 0
     
     for name, asset_config in ASSETS.items():
         log.info(f"🔍 Checking {name}...")
         
-        # Get data based on type
-        if asset_config["type"] in ["forex", "commodity"]:
-            if not ALPHA_VANTAGE_KEY:
-                log.warning(f"⚠️ {name} - Alpha Vantage key missing")
-                continue
-            
-            if asset_config["type"] == "forex":
-                current_price = get_alpha_vantage_price(asset_config["from"], "forex")
-                historical = get_alpha_vantage_historical(asset_config["from"], "forex")
-            else:
-                current_price = get_alpha_vantage_price(asset_config["symbol"], "commodity")
-                historical = get_alpha_vantage_historical(asset_config["symbol"], "commodity")
-        else:  # crypto
-            current_price = get_crypto_price(asset_config["id"])
-            historical = get_crypto_historical(asset_config["id"], days=30)
+        # Get current price (cached)
+        current_price = get_asset_price(name, asset_config)
         
         if current_price > 0:
-            log.info(f"📊 {name} - ${current_price:,.2f}")
+            log.info(f"💰 {name}: ${current_price:,.2f}")
             
             # Generate signal
-            signal_type, reason = generate_signal(name, asset_config, current_price, historical)
+            signal_type, reason = generate_signal(name, asset_config, current_price)
             
             if signal_type and reason:
                 if not check_cooldown(name):
-                    if send_signal(name, signal_type, reason, current_price, asset_config.get("emoji", "📊")):
+                    if send_signal(name, signal_type, reason, current_price, asset_config["emoji"]):
                         save_cooldown(name)
                         signals_found += 1
+                        log.info(f"🔔 {signal_type} signal sent for {name}")
                 else:
                     log.info(f"⏰ {name} - signal blocked (cooldown)")
+            else:
+                log.info(f"📊 {name} - no signal at this time")
         else:
             log.warning(f"⚠️ {name} - price unavailable (retrying next cycle)")
         
-        # Small delay between API calls to avoid rate limits
-        time.sleep(2)
+        # Delay between assets to avoid rate limits
+        time.sleep(3)
     
     if signals_found > 0:
-        log.info(f"✅ Sent {signals_found} signal(s)")
+        log.info(f"✅ Sent {signals_found} signal(s) this cycle")
     else:
         log.info("✅ No signals this cycle")
-    log.info("=" * 45)
+    
+    log.info("=" * 50)
 
 if __name__ == "__main__":
     main()
