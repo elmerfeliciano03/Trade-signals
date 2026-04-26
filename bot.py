@@ -1,3 +1,15 @@
+"""
+Telegram Signal Bot — XAUUSD & Crude Oil WTI
+Checks every 5 minutes for all EA entry conditions and sends a Telegram alert.
+
+Conditions (BUY signal):
+  1. Price > EMA200 on H4
+  2. Price > EMA200 on H1
+  3. Price > EMA200 on M5
+  4. EMA9 > EMA200 on M5
+  5. MACD line crosses Signal from below, both < 0 (on M5)
+"""
+
 import os
 import time
 import logging
@@ -28,10 +40,13 @@ _last_signal = {}
 SIGNAL_COOLDOWN_SECONDS = 3600
 
 # ---------------------------------------------------------------------------
-# EMA calculation
+# EMA calculation using numpy
 # ---------------------------------------------------------------------------
 def calculate_ema(prices, period):
     """Calculate EMA using numpy"""
+    if len(prices) < period:
+        return np.array([])
+    
     ema = np.zeros(len(prices))
     multiplier = 2 / (period + 1)
     
@@ -43,19 +58,12 @@ def calculate_ema(prices, period):
     
     return ema
 
-def fetch_and_validate(ticker, interval, period):
-    """Fetch data and return price array"""
+def fetch_prices(ticker, interval, period):
+    """Fetch price data and return close prices as numpy array"""
     df = yf.download(ticker, interval=interval, period=period, progress=False)
     if df.empty:
         raise ValueError(f"No data for {ticker}")
     return df['Close'].values
-
-def get_current_price(ticker):
-    """Get current price"""
-    df = yf.download(ticker, period="1d", interval="1m", progress=False)
-    if df.empty:
-        raise ValueError(f"No price data for {ticker}")
-    return float(df['Close'].iloc[-1])
 
 # ---------------------------------------------------------------------------
 # Condition checks
@@ -65,6 +73,8 @@ def check_price_above_ema200(prices):
     if len(prices) < 201:
         return False
     ema200 = calculate_ema(prices, 200)
+    if len(ema200) == 0:
+        return False
     return prices[-2] > ema200[-2]
 
 def check_ema9_above_ema200(prices):
@@ -73,14 +83,24 @@ def check_ema9_above_ema200(prices):
         return False
     ema9 = calculate_ema(prices, 9)
     ema200 = calculate_ema(prices, 200)
+    if len(ema9) == 0 or len(ema200) == 0:
+        return False
     return ema9[-2] > ema200[-2]
 
 def calculate_macd(prices, fast=12, slow=26, signal=9):
     """Calculate MACD"""
+    if len(prices) < slow:
+        return np.array([]), np.array([])
+    
     ema_fast = calculate_ema(prices, fast)
     ema_slow = calculate_ema(prices, slow)
+    
+    if len(ema_fast) == 0 or len(ema_slow) == 0:
+        return np.array([]), np.array([])
+    
     macd_line = ema_fast - ema_slow
     signal_line = calculate_ema(macd_line, signal)
+    
     return macd_line, signal_line
 
 def check_macd_bull_cross_below_zero(prices):
@@ -89,6 +109,9 @@ def check_macd_bull_cross_below_zero(prices):
         return False
     
     macd_line, signal_line = calculate_macd(prices)
+    
+    if len(macd_line) < 3 or len(signal_line) < 3:
+        return False
     
     mc_prev = macd_line[-3]
     sc_prev = signal_line[-3]
@@ -145,7 +168,7 @@ def run_all_checks(ticker):
         return False, {}, None
 
 # ---------------------------------------------------------------------------
-# Telegram functions (same as before)
+# Telegram functions
 # ---------------------------------------------------------------------------
 def send_telegram(message: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -175,7 +198,6 @@ def build_message(symbol_name: str, cond: dict, price: float) -> str:
 def main():
     log.info("Bot started. Checking every %d seconds.", CHECK_INTERVAL)
     
-    # Send startup message
     try:
         send_telegram("🤖 <b>Signal bot online.</b>\nWatching: " + ", ".join(SYMBOLS.keys()))
     except Exception as e:
@@ -198,7 +220,8 @@ def main():
                     else:
                         log.info("Signal for %s suppressed (cooldown).", name)
                 elif price:
-                    log.info("%s — no signal.", name)
+                    log.info("%s — no signal. Conditions: %s", name,
+                             {k: v for k, v in cond.items()})
                 else:
                     log.info("%s — check failed.", name)
 
