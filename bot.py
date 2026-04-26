@@ -1,6 +1,5 @@
 """
-Telegram Signal Bot — Uses Alpha Vantage (Forex/Commodities) + CoinGecko (Crypto)
-NO Yahoo Finance dependency - works 24/7
+Telegram Signal Bot - Using Alpha Vantage & CoinGecko (No Yahoo Finance)
 """
 
 import os
@@ -10,355 +9,181 @@ import requests
 from datetime import datetime, timezone
 import numpy as np
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+# Config
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-ALPHA_VANTAGE_KEY = os.environ["ALPHA_VANTAGE_KEY"]  # Get free from alphavantage.co
-CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+ALPHA_VANTAGE_KEY = os.environ["ALPHA_VANTAGE_KEY"]
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 
-# Assets to monitor
 ASSETS = {
     "XAUUSD": {"type": "forex", "from": "XAU", "to": "USD"},
-    "Crude Oil WTI": {"type": "commodity", "symbol": "WTI"},
+    "Crude Oil": {"type": "commodity", "symbol": "WTI"},
     "Bitcoin": {"type": "crypto", "id": "bitcoin"},
     "Ethereum": {"type": "crypto", "id": "ethereum"},
 }
 
 _last_signal = {}
-SIGNAL_COOLDOWN_SECONDS = 3600
+SIGNAL_COOLDOWN = 3600
 
-# ---------------------------------------------------------------------------
-# Alpha Vantage API (Forex & Commodities)
-# ---------------------------------------------------------------------------
-def get_alpha_vantage_data(function, symbol, interval="5min"):
-    """Fetch data from Alpha Vantage API"""
+# ============ ALPHA VANTAGE (Forex & Commodities) ============
+def get_alpha_vantage(symbol, interval="5min"):
     url = "https://www.alphavantage.co/query"
-    params = {
-        "function": function,
-        "symbol": symbol,
-        "interval": interval,
-        "apikey": ALPHA_VANTAGE_KEY,
-        "outputsize": "compact"
-    }
+    params = {"function": "FX_INTRADAY" if "XAU" in symbol else "CRUDE_OIL_INTRADAY", 
+              "from_symbol" if "XAU" in symbol else "symbol": symbol, 
+              "to_symbol" if "XAU" in symbol else None: "USD" if "XAU" in symbol else None,
+              "interval": interval, "apikey": ALPHA_VANTAGE_KEY, "outputsize": "compact"}
+    params = {k: v for k, v in params.items() if v is not None}
     
     try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        
-        # Extract time series
-        if "Time Series FX (5min)" in data:
-            series = data["Time Series FX (5min)"]
-        elif "Time Series (5min)" in data:
-            series = data["Time Series (5min)"]
-        else:
-            return []
-        
-        # Extract closing prices
-        prices = []
-        for timestamp in sorted(series.keys()):
-            if "close" in series[timestamp]:
-                prices.append(float(series[timestamp]["4. close"]))
-            elif "4. close" in series[timestamp]:
-                prices.append(float(series[timestamp]["4. close"]))
-        
-        return prices
-        
-    except Exception as e:
-        log.error(f"Alpha Vantage error: {e}")
-        return []
-
-def get_forex_prices(from_currency, to_currency, bars=100):
-    """Get forex prices from Alpha Vantage"""
-    prices = get_alpha_vantage_data("FX_INTRADAY", f"{from_currency}{to_currency}", "5min")
-    return np.array(prices[-bars:]) if prices else np.array([])
-
-def get_commodity_prices(commodity, bars=100):
-    """Get commodity prices from Alpha Vantage"""
-    symbol_map = {"WTI": "WTI", "BRENT": "BZ"}
-    symbol = symbol_map.get(commodity, commodity)
-    prices = get_alpha_vantage_data("CRUDE_OIL_INTRADAY", symbol, "5min")
-    return np.array(prices[-bars:]) if prices else np.array([])
-
-def get_alpha_vantage_hourly(function, symbol):
-    """Get hourly data from Alpha Vantage"""
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": function,
-        "symbol": symbol,
-        "interval": "60min",
-        "apikey": ALPHA_VANTAGE_KEY,
-        "outputsize": "compact"
-    }
-    
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        
-        if "Time Series FX (60min)" in data:
-            series = data["Time Series FX (60min)"]
-        elif "Time Series (60min)" in data:
-            series = data["Time Series (60min)"]
-        else:
-            return []
-        
-        prices = []
-        for timestamp in sorted(series.keys()):
-            if "close" in series[timestamp]:
-                prices.append(float(series[timestamp]["4. close"]))
-        
-        return prices
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        series = data.get("Time Series FX (5min)") or data.get("Time Series (5min)") or {}
+        prices = [float(v["4. close"]) for v in sorted(series.values())]
+        return np.array(prices[-100:]) if prices else np.array([])
     except:
-        return []
+        return np.array([])
 
-# ---------------------------------------------------------------------------
-# CoinGecko API (Crypto - works 24/7)
-# ---------------------------------------------------------------------------
-def get_crypto_prices(crypto_id, days=1):
-    """Fetch crypto prices from CoinGecko"""
+# ============ COINGECKO (Crypto) ============
+def get_crypto(crypto_id):
     try:
-        url = f"https://api.coingecko.com/api/v3/coins/{crypto_id}/market_chart"
-        params = {"vs_currency": "usd", "days": days, "interval": "hourly"}
-        
-        response = requests.get(url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            prices = data.get("prices", [])
-            if prices:
-                # Get last 100 prices
-                price_values = [p[1] for p in prices]
-                return np.array(price_values[-100:])
-    except Exception as e:
-        log.error(f"CoinGecko error for {crypto_id}: {e}")
-    
+        r = requests.get(f"https://api.coingecko.com/api/v3/coins/{crypto_id}/market_chart", 
+                        params={"vs_currency": "usd", "days": 3, "interval": "hourly"}, timeout=10)
+        if r.status_code == 200:
+            prices = r.json().get("prices", [])
+            return np.array([p[1] for p in prices[-100:]]) if prices else np.array([])
+    except:
+        pass
     return np.array([])
 
-def get_crypto_hourly(crypto_id):
-    """Get hourly crypto data"""
-    return get_crypto_prices(crypto_id, days=7)
+def get_crypto_5min(crypto_id):
+    try:
+        r = requests.get(f"https://api.coingecko.com/api/v3/coins/{crypto_id}/market_chart",
+                        params={"vs_currency": "usd", "days": 1, "interval": "5m"}, timeout=10)
+        if r.status_code == 200:
+            prices = r.json().get("prices", [])
+            return np.array([p[1] for p in prices[-100:]]) if prices else np.array([])
+    except:
+        pass
+    return np.array([])
 
-# ---------------------------------------------------------------------------
-# Technical Indicators
-# ---------------------------------------------------------------------------
-def calculate_ema(prices, period):
+# ============ Technical Indicators ============
+def ema(prices, period):
     if len(prices) < period:
         return np.array([])
-    ema = np.zeros(len(prices))
     multiplier = 2 / (period + 1)
-    ema[period-1] = np.mean(prices[:period])
+    ema_vals = np.zeros(len(prices))
+    ema_vals[period-1] = np.mean(prices[:period])
     for i in range(period, len(prices)):
-        ema[i] = (prices[i] - ema[i-1]) * multiplier + ema[i-1]
-    return ema
+        ema_vals[i] = (prices[i] - ema_vals[i-1]) * multiplier + ema_vals[i-1]
+    return ema_vals
 
-def calculate_macd(prices, fast=12, slow=26, signal=9):
+def macd(prices, fast=12, slow=26, signal=9):
     if len(prices) < slow:
         return np.array([]), np.array([])
-    ema_fast = calculate_ema(prices, fast)
-    ema_slow = calculate_ema(prices, slow)
-    if len(ema_fast) == 0 or len(ema_slow) == 0:
-        return np.array([]), np.array([])
-    macd_line = ema_fast - ema_slow
-    signal_line = calculate_ema(macd_line, signal)
+    macd_line = ema(prices, fast) - ema(prices, slow)
+    signal_line = ema(macd_line, signal)
     return macd_line, signal_line
 
 def check_price_above_ema200(prices):
-    if len(prices) < 200:
-        # Use shorter EMA if not enough data
-        period = min(50, len(prices) // 2)
-        if len(prices) < period + 1:
-            return False
-        ema = calculate_ema(prices, period)
-        if len(ema) == 0:
-            return False
-        return prices[-2] > ema[-2]
-    
-    ema200 = calculate_ema(prices, 200)
+    if len(prices) < 30:
+        return False
+    ema200 = ema(prices, min(200, len(prices)-1))
     if len(ema200) == 0:
         return False
     return prices[-2] > ema200[-2]
 
 def check_ema9_above_ema200(prices):
-    if len(prices) < 50:
+    if len(prices) < 30:
         return False
-    ema9 = calculate_ema(prices, 9)
-    ema200 = calculate_ema(prices, min(200, len(prices) - 1))
-    if len(ema9) == 0 or len(ema200) == 0:
-        return False
-    return ema9[-2] > ema200[-2]
+    e9 = ema(prices, 9)
+    e200 = ema(prices, min(200, len(prices)-1))
+    return e9[-2] > e200[-2]
 
-def check_macd_bull_cross_below_zero(prices):
+def check_macd_cross(prices):
     if len(prices) < 35:
         return False
-    macd_line, signal_line = calculate_macd(prices)
-    if len(macd_line) < 3 or len(signal_line) < 3:
+    ml, sl = macd(prices)
+    if len(ml) < 3:
         return False
-    
-    mc_prev = macd_line[-3]
-    sc_prev = signal_line[-3]
-    mc_curr = macd_line[-2]
-    sc_curr = signal_line[-2]
-    
-    cross_up = mc_prev < sc_prev and mc_curr >= sc_curr
-    below_zero = mc_curr < 0 and sc_curr < 0
-    
-    return cross_up and below_zero
+    cross = ml[-3] < sl[-3] and ml[-2] >= sl[-2]
+    below_zero = ml[-2] < 0 and sl[-2] < 0
+    return cross and below_zero
 
-def resample_to_h4(prices_h1):
-    """Resample hourly to 4-hour"""
-    if len(prices_h1) < 4:
-        return np.array([])
-    num_h4_bars = len(prices_h1) // 4
-    prices_h4 = np.zeros(num_h4_bars)
-    for i in range(num_h4_bars):
-        start_idx = i * 4
-        end_idx = start_idx + 4
-        prices_h4[i] = np.mean(prices_h1[start_idx:end_idx])
-    return prices_h4
-
-# ---------------------------------------------------------------------------
-# Asset-specific data fetching
-# ---------------------------------------------------------------------------
-def fetch_asset_data(asset_name, asset_config):
-    """Fetch price data based on asset type"""
-    asset_type = asset_config["type"]
-    
+# ============ Main Check ============
+def check_asset(name, config):
     try:
-        if asset_type == "forex":
-            # 5-min data
-            prices_m5 = get_forex_prices(asset_config["from"], asset_config["to"])
-            # Hourly data (approximate from 5-min)
-            prices_h1 = prices_m5[::12] if len(prices_m5) >= 60 else prices_m5
-            
-        elif asset_type == "commodity":
-            prices_m5 = get_commodity_prices(asset_config["symbol"])
-            prices_h1 = prices_m5[::12] if len(prices_m5) >= 60 else prices_m5
-            
-        elif asset_type == "crypto":
-            prices_m5 = get_crypto_prices(asset_config["id"], days=1)
-            prices_h1 = get_crypto_hourly(asset_config["id"])
-            if len(prices_h1) == 0:
-                prices_h1 = prices_m5[::12] if len(prices_m5) >= 60 else prices_m5
-        
-        else:
-            return None, None, None
+        if config["type"] == "forex":
+            prices_m5 = get_alpha_vantage(f"{config['from']}{config['to']}", "5min")
+            prices_h1 = get_alpha_vantage(f"{config['from']}{config['to']}", "60min")
+        elif config["type"] == "commodity":
+            prices_m5 = get_alpha_vantage(config["symbol"], "5min")
+            prices_h1 = get_alpha_vantage(config["symbol"], "60min")
+        else:  # crypto
+            prices_m5 = get_crypto_5min(config["id"])
+            prices_h1 = get_crypto(config["id"])
         
         if len(prices_m5) < 10:
-            return None, None, None
+            return False, {}, None
         
-        current_price = prices_m5[-1]
-        prices_h4 = resample_to_h4(prices_h1) if len(prices_h1) >= 20 else prices_m5[::48]
+        current = prices_m5[-1]
+        prices_h4 = prices_h1[::4] if len(prices_h1) >= 20 else prices_m5[::48]
         
-        return prices_m5, prices_h1, prices_h4, current_price
+        cond = {
+            "H4 price > EMA200": check_price_above_ema200(prices_h4) if len(prices_h4) >= 10 else True,
+            "H1 price > EMA200": check_price_above_ema200(prices_h1) if len(prices_h1) >= 20 else True,
+            "M5 price > EMA200": check_price_above_ema200(prices_m5),
+            "M5 EMA9 > EMA200": check_ema9_above_ema200(prices_m5),
+            "MACD bullish cross": check_macd_cross(prices_m5),
+        }
         
+        return all(cond.values()), cond, current
     except Exception as e:
-        log.error(f"Error fetching {asset_name}: {e}")
-        return None, None, None, None
-
-def run_all_checks(asset_name, asset_config):
-    """Run all trading conditions"""
-    result = fetch_asset_data(asset_name, asset_config)
-    if result[0] is None:
+        log.error(f"Error on {name}: {e}")
         return False, {}, None
-    
-    prices_m5, prices_h1, prices_h4, current_price = result
-    
-    cond = {
-        "H4 price > EMA200": check_price_above_ema200(prices_h4) if len(prices_h4) >= 10 else True,
-        "H1 price > EMA200": check_price_above_ema200(prices_h1) if len(prices_h1) >= 20 else True,
-        "M5 price > EMA200": check_price_above_ema200(prices_m5),
-        "M5 EMA9 > EMA200": check_ema9_above_ema200(prices_m5),
-        "MACD bull cross <0": check_macd_bull_cross_below_zero(prices_m5),
-    }
-    
-    triggered = all(cond.values())
-    return triggered, cond, current_price
 
-# ---------------------------------------------------------------------------
-# Telegram Functions
-# ---------------------------------------------------------------------------
-def send_telegram(message: str) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+# ============ Telegram ============
+def send_tg(msg):
     try:
-        requests.post(url, json=payload, timeout=10).raise_for_status()
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                     json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
         log.info("✅ Telegram sent")
-    except Exception as e:
-        log.error(f"Telegram failed: {e}")
-
-def build_message(asset_name: str, cond: dict, price: float) -> str:
-    tick = lambda v: "✅" if v else "❌"
-    
-    emoji_map = {
-        "XAUUSD": "🥇",
-        "Crude Oil WTI": "🛢️",
-        "Bitcoin": "₿",
-        "Ethereum": "Ξ"
-    }
-    emoji = emoji_map.get(asset_name, "📊")
-    
-    lines = [
-        f"<b>{emoji} BUY SIGNAL — {asset_name}</b>",
-        f"<b>Price:</b> ${price:,.2f}",
-        f"<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
-        "",
-        "<b>Conditions:</b>",
-    ]
-    lines.extend([f"  {tick(v)} {k}" for k, v in cond.items()])
-    return "\n".join(lines)
-
-# ---------------------------------------------------------------------------
-# Main Loop
-# ---------------------------------------------------------------------------
-def main():
-    log.info("=" * 55)
-    log.info("🚀 SIGNAL BOT - ALPHA VANTAGE + COINGECKO")
-    log.info("=" * 55)
-    log.info("No Yahoo Finance dependency - works 24/7!")
-    log.info(f"Monitoring: {', '.join(ASSETS.keys())}")
-    
-    # Send startup message
-    try:
-        msg = f"""🤖 <b>Signal Bot Online - NEW VERSION</b>
-
-✅ Using Alpha Vantage (Forex/Commodities)
-✅ Using CoinGecko (Crypto)
-✅ No Yahoo Finance - works 24/7!
-
-📊 Monitoring:
-• 🥇 XAUUSD (Gold)
-• 🛢️ Crude Oil WTI
-• ₿ Bitcoin
-• Ξ Ethereum
-
-⏱️ Check interval: {CHECK_INTERVAL}s"""
-        send_telegram(msg)
     except:
         pass
+
+def build_msg(name, cond, price):
+    emoji = "🥇" if "XAU" in name else "🛢️" if "Crude" in name else "₿" if "Bitcoin" in name else "Ξ"
+    lines = [f"<b>{emoji} BUY SIGNAL — {name}</b>", f"<b>Price:</b> ${price:,.2f}",
+             f"<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC", "", "<b>Conditions:</b>"]
+    lines.extend([f"  {'✅' if v else '❌'} {k}" for k, v in cond.items()])
+    return "\n".join(lines)
+
+# ============ Main Loop ============
+def main():
+    log.info("=" * 50)
+    log.info("🚀 SIGNAL BOT - ALPHA VANTAGE + COINGECKO")
+    log.info("NO YAHOO FINANCE - WORKS 24/7")
+    log.info(f"Monitoring: {', '.join(ASSETS.keys())}")
+    log.info("=" * 50)
+    
+    send_tg("🤖 <b>Signal Bot Online - NEW VERSION</b>\n\n✅ Using Alpha Vantage + CoinGecko\n✅ No Yahoo Finance!\n✅ Works 24/7")
     
     while True:
         for name, config in ASSETS.items():
             log.info(f"📊 Checking {name}...")
-            triggered, cond, price = run_all_checks(name, config)
+            triggered, cond, price = check_asset(name, config)
             
             if triggered and price:
                 now = datetime.now(timezone.utc)
                 last = _last_signal.get(name)
-                if last is None or (now - last).total_seconds() >= SIGNAL_COOLDOWN_SECONDS:
-                    send_telegram(build_message(name, cond, price))
+                if not last or (now - last).total_seconds() >= SIGNAL_COOLDOWN:
+                    send_tg(build_msg(name, cond, price))
                     _last_signal[name] = now
-                    log.info(f"🔔 SIGNAL for {name} at ${price:,.2f}")
+                    log.info(f"🔔 SIGNAL for {name}!")
             elif price:
-                failed = [k for k, v in cond.items() if not v]
-                if failed:
-                    log.info(f"❌ {name} - no signal ({failed[0]})")
+                log.info(f"❌ {name} - no signal")
             
             time.sleep(2)
         
