@@ -34,12 +34,18 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 
-# WORKING SYMBOLS for Yahoo Finance
+# WORKING SYMBOLS for Yahoo Finance - UPDATED WITH FIXES
 SYMBOLS = {
-    "XAUUSD":         "XAUUSD=X",   # Gold (forex pair - works weekends)
-    "Crude Oil WTI":  "CL=F",       # WTI Crude (futures - better on weekdays)
+    "XAUUSD":         "XAUUSD=X",   # Gold (forex pair - works 24/5)
+    "Crude Oil WTI":  "BZ=F",       # Brent Crude (more reliable than CL=F)
     "Bitcoin":        "BTC-USD",    # Bitcoin (crypto - works 24/7)
     "Ethereum":       "ETH-USD",    # Ethereum (crypto - works 24/7)
+}
+
+# Fallback symbols if primary fails
+FALLBACK_SYMBOLS = {
+    "XAUUSD": "GC=F",           # Gold futures (weekdays only)
+    "Crude Oil WTI": "CL=F",    # WTI Crude (weekdays only)
 }
 
 _last_signal = {}
@@ -54,6 +60,27 @@ VWAP_VOLUME_SPIKE_THRESHOLD = 1.5  # 50% above average volume
 # Crypto-specific adjustments (more volatile)
 CRYPTO_VWAP_DEVIATION = 0.01      # 1% for crypto (more tolerant)
 CRYPTO_VOLUME_THRESHOLD = 1.3     # 1.3x for crypto
+
+# ---------------------------------------------------------------------------
+# Helper function to fetch with fallback
+# ---------------------------------------------------------------------------
+def fetch_with_fallback(ticker_name, yahoo_symbol, interval, period):
+    """Try primary symbol first, then fallback if available"""
+    # Try primary symbol
+    df = fetch_data(yahoo_symbol, interval, period)
+    if df is not None and not df.empty:
+        return df
+    
+    # Try fallback if exists
+    if ticker_name in FALLBACK_SYMBOLS:
+        fallback = FALLBACK_SYMBOLS[ticker_name]
+        log.warning(f"Primary symbol {yahoo_symbol} failed for {ticker_name}, trying fallback {fallback}")
+        df = fetch_data(fallback, interval, period)
+        if df is not None and not df.empty:
+            log.info(f"Successfully using fallback symbol {fallback} for {ticker_name}")
+            return df
+    
+    return None
 
 # ---------------------------------------------------------------------------
 # EMA calculation using numpy
@@ -79,10 +106,10 @@ def fetch_data(ticker, interval, period):
     try:
         df = yf.download(ticker, interval=interval, period=period, progress=False, timeout=10)
         if df.empty:
-            raise ValueError(f"No data for {ticker}")
+            return None
         return df
     except Exception as e:
-        log.error(f"Failed to fetch {ticker} @ {interval}: {e}")
+        log.debug(f"Failed to fetch {ticker} @ {interval}: {e}")
         return None
 
 def fetch_prices(ticker, interval, period):
@@ -128,7 +155,7 @@ def calculate_vwap(high, low, close, volume):
     
     return vwap
 
-def detect_vwap_spike(ticker, lookback_bars=20, deviation_threshold=VWAP_DEVIATION_THRESHOLD, volume_spike_threshold=VWAP_VOLUME_SPIKE_THRESHOLD):
+def detect_vwap_spike(ticker, lookback_bars=20):
     """
     Detect sudden VWAP spike with volume confirmation
     
@@ -145,13 +172,14 @@ def detect_vwap_spike(ticker, lookback_bars=20, deviation_threshold=VWAP_DEVIATI
         if is_crypto:
             deviation_threshold = CRYPTO_VWAP_DEVIATION
             volume_spike_threshold = CRYPTO_VOLUME_THRESHOLD
-            log.debug(f"Crypto detected {ticker}, using adjusted thresholds (dev: {deviation_threshold:.1%}, vol: {volume_spike_threshold}x)")
+        else:
+            deviation_threshold = VWAP_DEVIATION_THRESHOLD
+            volume_spike_threshold = VWAP_VOLUME_SPIKE_THRESHOLD
         
-        # Fetch M1 or M5 data for VWAP (intraday)
+        # Fetch M5 data for VWAP (intraday)
         o, h, l, c, v = fetch_ohlcv(ticker, "5m", "3d")
         
         if o is None or len(o) < lookback_bars:
-            log.warning(f"Not enough data for VWAP calculation on {ticker}")
             return False, 0, 0, 0, 0
         
         # Calculate VWAP
@@ -178,19 +206,15 @@ def detect_vwap_spike(ticker, lookback_bars=20, deviation_threshold=VWAP_DEVIATI
         else:
             price_velocity = 0
         
-        # Spike conditions:
-        # 1. Price deviates significantly from VWAP
-        # 2. Volume confirms the move (spike)
-        # 3. Rapid price movement
-        spike_conditions = {
-            "deviation_threshold_met": deviation >= deviation_threshold,
-            "volume_spike_met": volume_ratio >= volume_spike_threshold,
-            "price_velocity_met": price_velocity >= deviation_threshold / 2
-        }
+        # Spike conditions
+        spike_detected = (
+            deviation >= deviation_threshold and 
+            volume_ratio >= volume_spike_threshold and 
+            price_velocity >= deviation_threshold / 2
+        )
         
-        spike_detected = all(spike_conditions.values())
-        
-        log.debug(f"VWAP Check for {ticker} - Deviation: {deviation:.3%}, Volume Ratio: {volume_ratio:.2f}, Velocity: {price_velocity:.3%}")
+        if spike_detected:
+            log.info(f"VWAP SPIKE DETECTED on {ticker} - Dev: {deviation:.2%}, Vol: {volume_ratio:.1f}x")
         
         return spike_detected, deviation, volume_ratio, current_vwap, current_price
         
@@ -272,32 +296,35 @@ def resample_to_h4(prices_h1):
     
     return prices_h4
 
-def run_all_checks(ticker):
+def run_all_checks(ticker_name, yahoo_symbol):
     """Run all conditions and return (signal_triggered, conditions_dict, current_price)"""
     try:
         # For crypto, use shorter periods due to 24/7 trading
-        is_crypto = ticker in ["BTC-USD", "ETH-USD"]
+        is_crypto = yahoo_symbol in ["BTC-USD", "ETH-USD"]
         m5_period = "3d" if is_crypto else "5d"
         h1_period = "14d" if is_crypto else "30d"
         
-        # Fetch M5 data
-        prices_m5 = fetch_prices(ticker, "5m", m5_period)
-        if len(prices_m5) < 50:
-            log.warning(f"Not enough M5 data for {ticker}")
+        # Fetch M5 data with fallback
+        df_m5 = fetch_with_fallback(ticker_name, yahoo_symbol, "5m", m5_period)
+        if df_m5 is None or df_m5.empty:
+            log.warning(f"Not enough M5 data for {ticker_name}")
             return False, {}, None
         
+        prices_m5 = df_m5['Close'].values
         current_price = float(prices_m5[-1])
         
-        # Fetch H1 data for both H1 and H4
-        prices_h1 = fetch_prices(ticker, "1h", h1_period)
-        if len(prices_h1) < 200:
-            log.warning(f"Not enough H1 data for {ticker}")
+        # Fetch H1 data
+        df_h1 = fetch_with_fallback(ticker_name, yahoo_symbol, "1h", h1_period)
+        if df_h1 is None or df_h1.empty:
+            log.warning(f"Not enough H1 data for {ticker_name}")
             return False, {}, current_price
+        
+        prices_h1 = df_h1['Close'].values
         
         # Create H4 data by resampling H1
         prices_h4 = resample_to_h4(prices_h1)
         if len(prices_h4) < 50:
-            log.warning(f"Not enough H4 data for {ticker}")
+            log.warning(f"Not enough H4 data for {ticker_name}")
             return False, {}, current_price
         
         # Check all conditions
@@ -313,16 +340,24 @@ def run_all_checks(ticker):
         return triggered, cond, current_price
         
     except Exception as e:
-        log.error(f"Error in run_all_checks for {ticker}: {e}")
+        log.error(f"Error in run_all_checks for {ticker_name}: {e}")
         return False, {}, None
 
-def run_vwap_check(ticker):
+def run_vwap_check(ticker_name, yahoo_symbol):
     """Run VWAP spike detection separately"""
     try:
-        spike_detected, deviation, volume_ratio, vwap, price = detect_vwap_spike(ticker)
+        # Try primary symbol first
+        spike_detected, deviation, volume_ratio, vwap, price = detect_vwap_spike(yahoo_symbol)
+        
+        # If failed and has fallback, try fallback
+        if not spike_detected and ticker_name in FALLBACK_SYMBOLS:
+            fallback = FALLBACK_SYMBOLS[ticker_name]
+            log.debug(f"Trying VWAP with fallback {fallback} for {ticker_name}")
+            spike_detected, deviation, volume_ratio, vwap, price = detect_vwap_spike(fallback)
+        
         return spike_detected, deviation, volume_ratio, vwap, price
     except Exception as e:
-        log.error(f"Error in VWAP check for {ticker}: {e}")
+        log.error(f"Error in VWAP check for {ticker_name}: {e}")
         return False, 0, 0, 0, 0
 
 # ---------------------------------------------------------------------------
@@ -347,16 +382,23 @@ def build_message(symbol_name: str, cond: dict, price: float) -> str:
     """Build formatted Telegram message for BUY signal"""
     tick = lambda v: "✅" if v else "❌"
     
-    # Add crypto emoji if applicable
-    emoji = "🪙" if "Bitcoin" in symbol_name or "Ethereum" in symbol_name else "🟡"
+    # Add emoji based on symbol
     if "Bitcoin" in symbol_name:
         emoji = "₿"
+        price_str = f"${price:,.2f}"
     elif "Ethereum" in symbol_name:
         emoji = "Ξ"
+        price_str = f"${price:,.2f}"
+    elif "XAUUSD" in symbol_name:
+        emoji = "🥇"
+        price_str = f"${price:,.2f}"
+    else:
+        emoji = "🛢️"
+        price_str = f"${price:,.2f}"
     
     lines = [
         f"<b>{emoji} BUY SIGNAL — {symbol_name}</b>",
-        f"<b>Price:</b> ${price:.2f}" if "BTC" in symbol_name or "ETH" in symbol_name else f"<b>Price:</b> {price:.4f}",
+        f"<b>Price:</b> {price_str}",
         f"<b>Time (UTC):</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         "<b>Conditions met:</b>",
@@ -372,14 +414,21 @@ def build_vwap_message(symbol_name: str, deviation: float, volume_ratio: float, 
     direction = "ABOVE" if price > vwap else "BELOW"
     emoji = "📈" if price > vwap else "📉"
     
-    # Add crypto indicator
+    # Format price based on symbol
+    if "Bitcoin" in symbol_name or "Ethereum" in symbol_name:
+        price_str = f"${price:,.2f}"
+        vwap_str = f"${vwap:,.2f}"
+    else:
+        price_str = f"${price:,.2f}"
+        vwap_str = f"${vwap:,.2f}"
+    
     is_crypto = "Bitcoin" in symbol_name or "Ethereum" in symbol_name
     crypto_note = "\n<i>⚠️ Crypto is more volatile - consider wider stops</i>" if is_crypto else ""
     
     lines = [
         f"<b>{emoji} VWAP SPIKE ALERT — {symbol_name}</b>",
-        f"<b>Price:</b> ${price:.2f}" if "BTC" in symbol_name or "ETH" in symbol_name else f"<b>Price:</b> {price:.4f}",
-        f"<b>VWAP:</b> ${vwap:.2f}" if "BTC" in symbol_name or "ETH" in symbol_name else f"<b>VWAP:</b> {vwap:.4f}",
+        f"<b>Price:</b> {price_str}",
+        f"<b>VWAP:</b> {vwap_str}",
         f"<b>Deviation:</b> {deviation:.2%} {direction} VWAP",
         f"<b>Volume Spike:</b> {volume_ratio:.1f}x average",
         f"<b>Time (UTC):</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
@@ -396,20 +445,26 @@ def build_vwap_message(symbol_name: str, deviation: float, volume_ratio: float, 
 # ---------------------------------------------------------------------------
 def main():
     log.info("=" * 50)
-    log.info("Bot started. Checking every %d seconds.", CHECK_INTERVAL)
-    log.info("Monitoring symbols: %s", ", ".join(SYMBOLS.keys()))
+    log.info("🚀 Bot Started Successfully!")
+    log.info("=" * 50)
+    log.info("Checking every %d seconds.", CHECK_INTERVAL)
+    log.info("Monitoring symbols:")
+    for name, symbol in SYMBOLS.items():
+        log.info("  • %s (%s)", name, symbol)
+        if name in FALLBACK_SYMBOLS:
+            log.info("    Fallback: %s", FALLBACK_SYMBOLS[name])
     log.info("VWAP Spike Detection: ENABLED")
-    log.info("  - Forex/Commodities: 0.5% deviation, 1.5x volume")
-    log.info("  - Crypto (BTC/ETH): 1.0% deviation, 1.3x volume")
+    log.info("  - Forex/Commodities: 0.5%% deviation, 1.5x volume")
+    log.info("  - Crypto (BTC/ETH): 1.0%% deviation, 1.3x volume")
     log.info("=" * 50)
     
     # Send startup message
     try:
-        startup_msg = f"""🤖 <b>Signal Bot Online</b>
+        startup_msg = f"""🤖 <b>Signal Bot Online - FULLY OPERATIONAL</b>
 
 📊 <b>Watching:</b>
-• XAUUSD (Gold)
-• Crude Oil WTI
+• 🥇 XAUUSD (Gold) - XAUUSD=X
+• 🛢️ Crude Oil WTI - BZ=F
 • ₿ Bitcoin (BTC-USD)
 • Ξ Ethereum (ETH-USD)
 
@@ -422,8 +477,12 @@ def main():
 • Forex/Commodities: 0.5% deviation, 1.5x volume
 • Crypto (BTC/ETH): 1.0% deviation, 1.3x volume
 
-✅ Bot is active and monitoring..."""
+✅ <b>Bot is active and monitoring...</b>
+
+⚠️ <b>Note:</b> Gold & Oil symbols work best during market hours (Mon-Fri)
+BTC & ETH work 24/7"""
         send_telegram(startup_msg)
+        log.info("✅ Startup message sent to Telegram")
     except Exception as e:
         log.error(f"Failed to send startup message: {e}")
 
@@ -432,7 +491,7 @@ def main():
             # Check for regular BUY signal
             try:
                 log.info("📊 Checking %s (%s) for BUY signal…", name, ticker)
-                triggered, cond, price = run_all_checks(ticker)
+                triggered, cond, price = run_all_checks(name, ticker)
 
                 if triggered and price:
                     now = datetime.now(timezone.utc)
@@ -456,10 +515,13 @@ def main():
             except Exception as exc:
                 log.error("💥 Error checking %s for BUY signal: %s", name, exc)
             
+            # Small delay between checks for the same symbol
+            time.sleep(2)
+            
             # Check for VWAP spike signal
             try:
                 log.info("📈 Checking %s (%s) for VWAP spike…", name, ticker)
-                vwap_triggered, deviation, volume_ratio, vwap, price = run_vwap_check(ticker)
+                vwap_triggered, deviation, volume_ratio, vwap, price = run_vwap_check(name, ticker)
                 
                 if vwap_triggered and price and vwap:
                     now = datetime.now(timezone.utc)
@@ -473,14 +535,12 @@ def main():
                     else:
                         remaining = VWAP_COOLDOWN_SECONDS - (now - last_vwap).total_seconds()
                         log.info("⏰ VWAP alert for %s suppressed (cooldown: %.0f seconds remaining)", name, remaining)
-                elif vwap_triggered:
-                    log.info("❌ %s — no VWAP spike (insufficient data)", name)
                     
             except Exception as exc:
                 log.error("💥 Error checking %s for VWAP spike: %s", name, exc)
 
         # Wait before next check
-        log.info("💤 Sleeping for %d seconds...", CHECK_INTERVAL)
+        log.info("💤 Cycle complete. Sleeping for %d seconds...", CHECK_INTERVAL)
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
