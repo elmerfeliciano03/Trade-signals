@@ -2,8 +2,8 @@
 Telegram Signal Bot - 3-Condition Rules with Detailed Logging
 Shows exact values for each condition in logs
 
-LONG:  H4 > EMA200 + H1 > EMA200 + MACD cross below 0
-SHORT: H4 < EMA200 + H1 < EMA200 + MACD cross above 0
+LONG:  H4 > EMA200 + H1 > EMA200 + MACD cross below 0 (on 5min)
+SHORT: H4 < EMA200 + H1 < EMA200 + MACD cross above 0 (on 5min)
 
 Assets: Gold, Oil, BTC, ETH, Nasdaq (MNQ=F), S&P500 (MES=F)
 """
@@ -85,10 +85,10 @@ def fetch_with_fallback(asset_name, asset_config, interval, period="5d"):
 
 def get_asset_data(asset_name, asset_config):
     try:
-        # Fetch H1 data
+        # Fetch H1 data for H4 resampling and price vs EMA200
         df_h1 = fetch_with_fallback(asset_name, asset_config, "1h", "60d")
         if df_h1 is None or df_h1.empty:
-            return None, None
+            return None, None, None
         
         prices_h1 = df_h1['Close'].values
         
@@ -99,10 +99,18 @@ def get_asset_data(asset_name, asset_config):
         
         prices_h4 = np.array([np.mean(prices_h1[i*4:(i+1)*4]) for i in range(num_h4)])
         
-        return prices_h4, prices_h1
+        # Fetch M5 data for MACD calculation
+        df_m5 = fetch_with_fallback(asset_name, asset_config, "5m", "2d")
+        if df_m5 is None or df_m5.empty:
+            log.warning(f"⚠️ {asset_name}: Cannot fetch M5 data for MACD")
+            return prices_h4, prices_h1, None
+        
+        prices_m5 = df_m5['Close'].values
+        
+        return prices_h4, prices_h1, prices_m5
     except Exception as e:
         log.error(f"Error getting data for {asset_name}: {e}")
-        return None, None
+        return None, None, None
 
 # ============ TECHNICAL INDICATORS ============
 def calculate_ema(prices, period):
@@ -126,6 +134,7 @@ def get_ema_series(prices, period):
     return ema_values
 
 def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """Calculate MACD line and Signal line"""
     if len(prices) < slow:
         return None, None
     ema_fast_values = get_ema_series(prices, fast)
@@ -139,7 +148,7 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     return macd_line, signal_line
 
 # ============ SIGNAL CONDITIONS WITH DETAILED LOGGING ============
-def check_conditions(prices_h4, prices_h1, asset_name):
+def check_conditions(prices_h4, prices_h1, prices_m5, asset_name):
     if len(prices_h4) < 5 or len(prices_h1) < 20:
         return {"long": False, "short": False, "price": 0, 
                 "long_details": {}, "short_details": {}}
@@ -149,12 +158,19 @@ def check_conditions(prices_h4, prices_h1, asset_name):
     close_h1 = prices_h1[-2] if len(prices_h1) >= 2 else prices_h1[-1]
     current_price = close_h1
     
-    # Calculate EMAs
+    # Calculate EMAs on H4 and H1
     ema200_h4 = calculate_ema(prices_h4, min(200, len(prices_h4) - 1))
     ema200_h1 = calculate_ema(prices_h1, min(200, len(prices_h1) - 1))
     
-    # Calculate MACD on H1 data
-    macd_line, signal_line = calculate_macd(prices_h1)
+    # Calculate MACD on M5 data (NEW)
+    macd_line = None
+    signal_line = None
+    macd_value = "Insufficient M5 data"
+    
+    if prices_m5 is not None and len(prices_m5) >= 35:
+        macd_line, signal_line = calculate_macd(prices_m5)
+        if macd_line and signal_line and len(macd_line) >= 3:
+            macd_value = f"MACD: ${macd_line[-2]:.2f}, Signal: ${signal_line[-2]:.2f}"
     
     # ============ LONG CONDITIONS DETAILS ============
     long_details = {}
@@ -177,7 +193,7 @@ def check_conditions(prices_h4, prices_h1, asset_name):
     else:
         long_details["H1 Price > EMA200"] = {"passed": False, "value": "Insufficient data"}
     
-    # Condition 3: MACD cross below zero
+    # Condition 3: MACD cross below zero on M5
     if macd_line and signal_line and len(macd_line) >= 3:
         macd_prev = macd_line[-3]
         macd_curr = macd_line[-2]
@@ -185,12 +201,12 @@ def check_conditions(prices_h4, prices_h1, asset_name):
         signal_curr = signal_line[-2]
         long_cross = (macd_prev < signal_prev and macd_curr >= signal_curr)
         long_below_zero = (macd_curr < 0 and signal_curr < 0)
-        long_details["MACD cross below zero"] = {
+        long_details["MACD cross below zero (5min)"] = {
             "passed": long_cross and long_below_zero,
-            "value": f"MACD: ${macd_curr:.2f}, Signal: ${signal_curr:.2f} | Cross: {long_cross}, Below Zero: {long_below_zero}"
+            "value": f"{macd_value} | Cross: {long_cross}, Below Zero: {long_below_zero}"
         }
     else:
-        long_details["MACD cross below zero"] = {"passed": False, "value": "Insufficient MACD data"}
+        long_details["MACD cross below zero (5min)"] = {"passed": False, "value": macd_value}
     
     # ============ SHORT CONDITIONS DETAILS ============
     short_details = {}
@@ -213,7 +229,7 @@ def check_conditions(prices_h4, prices_h1, asset_name):
     else:
         short_details["H1 Price < EMA200"] = {"passed": False, "value": "Insufficient data"}
     
-    # Condition 3: MACD cross above zero
+    # Condition 3: MACD cross above zero on M5
     if macd_line and signal_line and len(macd_line) >= 3:
         macd_prev = macd_line[-3]
         macd_curr = macd_line[-2]
@@ -221,12 +237,12 @@ def check_conditions(prices_h4, prices_h1, asset_name):
         signal_curr = signal_line[-2]
         short_cross = (macd_prev > signal_prev and macd_curr <= signal_curr)
         short_above_zero = (macd_curr > 0 and signal_curr > 0)
-        short_details["MACD cross above zero"] = {
+        short_details["MACD cross above zero (5min)"] = {
             "passed": short_cross and short_above_zero,
-            "value": f"MACD: ${macd_curr:.2f}, Signal: ${signal_curr:.2f} | Cross: {short_cross}, Above Zero: {short_above_zero}"
+            "value": f"{macd_value} | Cross: {short_cross}, Above Zero: {short_above_zero}"
         }
     else:
-        short_details["MACD cross above zero"] = {"passed": False, "value": "Insufficient MACD data"}
+        short_details["MACD cross above zero (5min)"] = {"passed": False, "value": macd_value}
     
     long_signal = all(d["passed"] for d in long_details.values())
     short_signal = all(d["passed"] for d in short_details.values())
@@ -236,11 +252,7 @@ def check_conditions(prices_h4, prices_h1, asset_name):
         "short": short_signal,
         "price": current_price,
         "long_details": long_details,
-        "short_details": short_details,
-        "ema_h4": ema200_h4,
-        "ema_h1": ema200_h1,
-        "macd_curr": macd_line[-2] if macd_line and len(macd_line) >= 2 else None,
-        "signal_curr": signal_line[-2] if signal_line and len(signal_line) >= 2 else None
+        "short_details": short_details
     }
 
 # ============ LOGGING FUNCTIONS ============
@@ -270,16 +282,18 @@ def log_short_conditions(asset_name, details, current_price):
 def send_signal(asset_name, emoji, signal_type, price, details):
     # Get the conditions that passed
     conditions_passed = []
-    if signal_type == "LONG":
-        for condition, data in details.items():
-            if data["passed"]:
-                conditions_passed.append(f"  ✅ {condition}")
-    else:
-        for condition, data in details.items():
-            if data["passed"]:
-                conditions_passed.append(f"  ✅ {condition}")
+    for condition, data in details.items():
+        if data["passed"]:
+            conditions_passed.append(f"  ✅ {condition}")
     
     conditions_text = "\n".join(conditions_passed)
+    
+    # Get MACD value for display
+    macd_info = ""
+    for condition, data in details.items():
+        if "MACD" in condition:
+            macd_info = data["value"].split(" | ")[0] if " | " in data["value"] else data["value"]
+            break
     
     message = f"""<b>{'🟢' if signal_type == 'LONG' else '🔴'} {signal_type} SIGNAL — {emoji} {asset_name}</b>
 
@@ -306,8 +320,8 @@ def main():
     log.info("=" * 70)
     log.info("📊 TRADING SIGNAL BOT - DETAILED LOGGING MODE")
     log.info("=" * 70)
-    log.info("LONG:  H4 > EMA200 + H1 > EMA200 + MACD cross BELOW 0")
-    log.info("SHORT: H4 < EMA200 + H1 < EMA200 + MACD cross ABOVE 0")
+    log.info("LONG:  H4 > EMA200 + H1 > EMA200 + MACD cross BELOW 0 (on 5min)")
+    log.info("SHORT: H4 < EMA200 + H1 < EMA200 + MACD cross ABOVE 0 (on 5min)")
     log.info("=" * 70)
     log.info(f"Monitoring {len(ASSETS)} assets:")
     for name, config in ASSETS.items():
@@ -321,7 +335,7 @@ def main():
         log.info(f"🔍 Analyzing {name} ({asset_config['symbol']})...")
         log.info(f"{'='*50}")
         
-        prices_h4, prices_h1 = get_asset_data(name, asset_config)
+        prices_h4, prices_h1, prices_m5 = get_asset_data(name, asset_config)
         
         if prices_h4 is None or len(prices_h4) < 5:
             log.warning(f"⚠️ {name} - Insufficient H4 data (got {len(prices_h4) if prices_h4 is not None else 0} bars)")
@@ -331,7 +345,11 @@ def main():
             log.warning(f"⚠️ {name} - Insufficient H1 data (got {len(prices_h1) if prices_h1 is not None else 0} bars)")
             continue
         
-        result = check_conditions(prices_h4, prices_h1, name)
+        if prices_m5 is None or len(prices_m5) < 35:
+            log.warning(f"⚠️ {name} - Insufficient M5 data for MACD (got {len(prices_m5) if prices_m5 is not None else 0} bars)")
+            # Continue anyway, MACD will show as failed
+        
+        result = check_conditions(prices_h4, prices_h1, prices_m5, name)
         current_price = result.get("price", 0)
         
         # Display LONG conditions with exact values
