@@ -1,7 +1,6 @@
 """
-Telegram Signal Bot - Long & Short Signals
-WORKING SYMBOLS: GC=F (Gold), CL=F (Oil), BTC-USD, ETH-USD
-Fixed yfinance compatibility issue
+Telegram Signal Bot - SIGNALS ONLY
+Only sends Telegram messages when ALL conditions are met
 """
 
 import os
@@ -22,31 +21,14 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 COOLDOWN_FILE = "/tmp/last_signal.txt"
 SIGNAL_COOLDOWN = 3600  # 1 hour between signals per asset
 
-# WORKING YAHOO FINANCE SYMBOLS
 ASSETS = {
-    "Gold (XAUUSD)": {
-        "symbol": "GC=F",           # Gold futures - WORKING
-        "alt_symbol": "GLD",        # Gold ETF - fallback
-        "emoji": "🥇"
-    },
-    "Crude Oil WTI": {
-        "symbol": "CL=F",           # WTI Crude futures - WORKING
-        "alt_symbol": "USO",        # Oil ETF - fallback
-        "emoji": "🛢️"
-    },
-    "Bitcoin": {
-        "symbol": "BTC-USD",        # Bitcoin - WORKING
-        "alt_symbol": None,
-        "emoji": "₿"
-    },
-    "Ethereum": {
-        "symbol": "ETH-USD",        # Ethereum - WORKING
-        "alt_symbol": None,
-        "emoji": "Ξ"
-    }
+    "Gold": {"symbol": "GC=F", "alt_symbol": "GLD", "emoji": "🥇"},
+    "Crude Oil": {"symbol": "CL=F", "alt_symbol": "USO", "emoji": "🛢️"},
+    "Bitcoin": {"symbol": "BTC-USD", "alt_symbol": None, "emoji": "₿"},
+    "Ethereum": {"symbol": "ETH-USD", "alt_symbol": None, "emoji": "Ξ"}
 }
 
-# ============ COOLDOWN FUNCTIONS ============
+# ============ COOLDOWN ============
 def check_cooldown(asset):
     try:
         with open(COOLDOWN_FILE, 'r') as f:
@@ -66,327 +48,236 @@ def save_cooldown(asset):
     except:
         pass
 
-# ============ YAHOO FINANCE DATA FETCHING (FIXED) ============
+# ============ DATA FETCHING ============
 def fetch_data(symbol, interval, period="5d"):
-    """Fetch OHLCV data from Yahoo Finance - NO progress parameter"""
     try:
         ticker = yf.Ticker(symbol)
-        # Remove 'progress' parameter - it's not supported in new versions
         df = ticker.history(period=period, interval=interval)
-        
         if df is not None and not df.empty:
             return df
     except Exception as e:
-        log.debug(f"Error fetching {symbol} @ {interval}: {e}")
-    
+        log.debug(f"Error fetching {symbol}: {e}")
     return None
 
 def fetch_with_fallback(asset_name, asset_config, interval, period="5d"):
-    """Try primary symbol first, then alt symbol"""
     symbol = asset_config["symbol"]
-    
-    # Try primary symbol
     df = fetch_data(symbol, interval, period)
-    
     if df is not None and not df.empty:
-        log.debug(f"✅ {asset_name}: Using {symbol}")
         return df
-    
-    # Try alt symbol if available
     alt_symbol = asset_config.get("alt_symbol")
     if alt_symbol:
-        log.info(f"⚠️ {symbol} failed for {asset_name}, trying {alt_symbol}")
         df = fetch_data(alt_symbol, interval, period)
         if df is not None and not df.empty:
-            log.info(f"✅ {asset_name}: Using fallback {alt_symbol}")
             return df
-    
     return None
 
 def get_asset_data(asset_name, asset_config):
-    """Fetch all required timeframes for an asset"""
     try:
-        # Fetch H1 data for H4 resampling
         df_h1 = fetch_with_fallback(asset_name, asset_config, "1h", "60d")
         if df_h1 is None or df_h1.empty:
-            log.warning(f"❌ {asset_name}: Cannot fetch H1 data")
             return None, None, None
         
         prices_h1 = df_h1['Close'].values
-        
-        # Resample to H4 (every 4 hours)
         num_h4 = len(prices_h1) // 4
-        if num_h4 < 20:
-            log.warning(f"⚠️ {asset_name}: Only {num_h4} H4 bars available")
-        
         prices_h4 = np.array([np.mean(prices_h1[i*4:(i+1)*4]) for i in range(num_h4)])
         
-        # Fetch M5 data
         df_m5 = fetch_with_fallback(asset_name, asset_config, "5m", "2d")
         if df_m5 is None or df_m5.empty:
-            log.warning(f"❌ {asset_name}: Cannot fetch M5 data")
             return None, None, None
         
         prices_m5 = df_m5['Close'].values
-        
-        log.info(f"📊 {asset_name}: H4={len(prices_h4)} bars, H1={len(prices_h1)} bars, M5={len(prices_m5)} bars")
-        
         return prices_h4, prices_h1, prices_m5
-        
     except Exception as e:
-        log.error(f"❌ Error getting data for {asset_name}: {e}")
+        log.error(f"Error getting data for {asset_name}: {e}")
         return None, None, None
 
 # ============ TECHNICAL INDICATORS ============
 def calculate_ema(prices, period):
-    """Calculate Exponential Moving Average"""
     if len(prices) < period:
         return None
-    
     multiplier = 2 / (period + 1)
     ema = prices[0]
-    
     for price in prices[1:]:
         ema = (price - ema) * multiplier + ema
-    
     return ema
 
 def get_ema_series(prices, period):
-    """Get full EMA series for condition checking"""
     if len(prices) < period:
         return []
-    
     ema_values = []
     multiplier = 2 / (period + 1)
     ema = prices[0]
-    
     for price in prices:
         ema = (price - ema) * multiplier + ema
         ema_values.append(ema)
-    
     return ema_values
 
 def calculate_macd(prices, fast=12, slow=26, signal=9):
-    """Calculate MACD line and Signal line"""
     if len(prices) < slow:
         return None, None
-    
-    # Calculate EMAs
     ema_fast_values = get_ema_series(prices, fast)
     ema_slow_values = get_ema_series(prices, slow)
-    
     if len(ema_fast_values) < slow or len(ema_slow_values) < slow:
         return None, None
-    
-    # MACD Line = Fast EMA - Slow EMA
     macd_line = [ema_fast_values[i] - ema_slow_values[i] for i in range(len(ema_slow_values))]
-    
-    # Signal Line = EMA of MACD Line
     signal_line = get_ema_series(macd_line, signal)
-    
     if len(signal_line) < 2:
         return None, None
-    
     return macd_line, signal_line
 
+# ============ SIGNAL CONDITIONS ============
 def check_conditions(prices_h4, prices_h1, prices_m5):
-    """Check all long and short conditions"""
-    
     if len(prices_h4) < 20:
-        return {"long": False, "long_details": {}, "short": False, "short_details": {}, "price": 0}
+        return {"long": False, "short": False, "price": 0}
     
-    # Get most recent values (use last closed bar)
     close_h4 = prices_h4[-2] if len(prices_h4) >= 2 else prices_h4[-1]
     close_h1 = prices_h1[-2] if len(prices_h1) >= 2 else prices_h1[-1]
     close_m5 = prices_m5[-2] if len(prices_m5) >= 2 else prices_m5[-1]
     current_price = close_m5
     
-    # Calculate EMAs (use available data)
     ema200_h4 = calculate_ema(prices_h4, min(200, len(prices_h4) - 1))
     ema200_h1 = calculate_ema(prices_h1, min(200, len(prices_h1) - 1))
     ema200_m5 = calculate_ema(prices_m5, min(200, len(prices_m5) - 1))
-    ema9_m5 = calculate_ema(prices_m5, min(9, len(prices_m5) - 1)) if len(prices_m5) >= 10 else None
+    ema9_m5 = calculate_ema(prices_m5, min(9, len(prices_m5) - 1))
     
-    # MACD calculation
     macd_line, signal_line = calculate_macd(prices_m5)
     
-    # Initialize results
-    long_conditions = {}
-    short_conditions = {}
-    
-    # Conditions 1-3: Price vs EMA200
-    long_conditions["H4 Price > EMA200"] = (close_h4 > ema200_h4) if ema200_h4 else False
-    short_conditions["H4 Price < EMA200"] = (close_h4 < ema200_h4) if ema200_h4 else False
-    
-    long_conditions["H1 Price > EMA200"] = (close_h1 > ema200_h1) if ema200_h1 else False
-    short_conditions["H1 Price < EMA200"] = (close_h1 < ema200_h1) if ema200_h1 else False
-    
-    long_conditions["M5 Price > EMA200"] = (close_m5 > ema200_m5) if ema200_m5 else False
-    short_conditions["M5 Price < EMA200"] = (close_m5 < ema200_m5) if ema200_m5 else False
-    
-    # Condition 4: EMA9 vs EMA200
-    if ema9_m5 and ema200_m5:
-        long_conditions["EMA9 > EMA200"] = ema9_m5 > ema200_m5
-        short_conditions["EMA9 < EMA200"] = ema9_m5 < ema200_m5
+    # LONG CONDITIONS
+    long_conditions = []
+    if ema200_h4 and close_h4 > ema200_h4:
+        long_conditions.append(True)
     else:
-        long_conditions["EMA9 > EMA200"] = False
-        short_conditions["EMA9 < EMA200"] = False
+        long_conditions.append(False)
     
-    # Condition 5: Price vs EMA9
-    if ema9_m5:
-        long_conditions["Price > EMA9"] = close_m5 > ema9_m5
-        short_conditions["Price < EMA9"] = close_m5 < ema9_m5
+    if ema200_h1 and close_h1 > ema200_h1:
+        long_conditions.append(True)
     else:
-        long_conditions["Price > EMA9"] = False
-        short_conditions["Price < EMA9"] = False
+        long_conditions.append(False)
     
-    # Condition 6: MACD crossover
-    if macd_line and signal_line and len(macd_line) >= 3 and len(signal_line) >= 3:
+    if ema200_m5 and close_m5 > ema200_m5:
+        long_conditions.append(True)
+    else:
+        long_conditions.append(False)
+    
+    if ema9_m5 and ema200_m5 and ema9_m5 > ema200_m5:
+        long_conditions.append(True)
+    else:
+        long_conditions.append(False)
+    
+    if ema9_m5 and close_m5 > ema9_m5:
+        long_conditions.append(True)
+    else:
+        long_conditions.append(False)
+    
+    if macd_line and signal_line and len(macd_line) >= 3:
         macd_prev = macd_line[-3]
         macd_curr = macd_line[-2]
         signal_prev = signal_line[-3]
         signal_curr = signal_line[-2]
-        
-        # Long: MACD crosses Signal from BELOW, both < 0
-        long_macd_cross = (macd_prev < signal_prev and macd_curr >= signal_curr)
-        long_macd_below_zero = (macd_curr < 0 and signal_curr < 0)
-        long_conditions["MACD cross below zero"] = long_macd_cross and long_macd_below_zero
-        
-        # Short: MACD crosses Signal from ABOVE, both > 0
-        short_macd_cross = (macd_prev > signal_prev and macd_curr <= signal_curr)
-        short_macd_above_zero = (macd_curr > 0 and signal_curr > 0)
-        short_conditions["MACD cross above zero"] = short_macd_cross and short_macd_above_zero
+        long_cross = (macd_prev < signal_prev and macd_curr >= signal_curr)
+        long_below_zero = (macd_curr < 0 and signal_curr < 0)
+        long_conditions.append(long_cross and long_below_zero)
     else:
-        long_conditions["MACD cross below zero"] = False
-        short_conditions["MACD cross above zero"] = False
+        long_conditions.append(False)
     
-    # Check if all conditions are met
-    long_signal = all(long_conditions.values())
-    short_signal = all(short_conditions.values())
+    # SHORT CONDITIONS
+    short_conditions = []
+    if ema200_h4 and close_h4 < ema200_h4:
+        short_conditions.append(True)
+    else:
+        short_conditions.append(False)
+    
+    if ema200_h1 and close_h1 < ema200_h1:
+        short_conditions.append(True)
+    else:
+        short_conditions.append(False)
+    
+    if ema200_m5 and close_m5 < ema200_m5:
+        short_conditions.append(True)
+    else:
+        short_conditions.append(False)
+    
+    if ema9_m5 and ema200_m5 and ema9_m5 < ema200_m5:
+        short_conditions.append(True)
+    else:
+        short_conditions.append(False)
+    
+    if ema9_m5 and close_m5 < ema9_m5:
+        short_conditions.append(True)
+    else:
+        short_conditions.append(False)
+    
+    if macd_line and signal_line and len(macd_line) >= 3:
+        macd_prev = macd_line[-3]
+        macd_curr = macd_line[-2]
+        signal_prev = signal_line[-3]
+        signal_curr = signal_line[-2]
+        short_cross = (macd_prev > signal_prev and macd_curr <= signal_curr)
+        short_above_zero = (macd_curr > 0 and signal_curr > 0)
+        short_conditions.append(short_cross and short_above_zero)
+    else:
+        short_conditions.append(False)
     
     return {
-        "long": long_signal,
-        "long_details": long_conditions,
-        "short": short_signal,
-        "short_details": short_conditions,
+        "long": all(long_conditions),
+        "short": all(short_conditions),
         "price": current_price
     }
 
-# ============ TELEGRAM FUNCTIONS ============
-def send_telegram(message):
+# ============ TELEGRAM ============
+def send_signal(asset_name, emoji, signal_type, price):
+    message = f"""<b>{'🟢' if signal_type == 'LONG' else '🔴'} {signal_type} ENTRY SIGNAL — {emoji} {asset_name}</b>
+
+<b>Price:</b> ${price:,.2f}
+<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+<b>All 6 conditions met!</b>
+
+<code>{'🚀 Consider LONG position' if signal_type == 'LONG' else '📉 Consider SHORT position'}
+📍 {'Stop loss below swing low' if signal_type == 'LONG' else 'Stop loss above swing high'}
+🎯 Take profit at 2:1 risk/reward</code>"""
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }, timeout=10)
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
         r.raise_for_status()
-        log.info("✅ Telegram sent")
+        log.info(f"✅ {signal_type} signal sent for {asset_name}")
         return True
     except Exception as e:
         log.error(f"Telegram failed: {e}")
         return False
 
-def build_long_message(asset_name, emoji, price, conditions):
-    """Build long signal message"""
-    message = f"""<b>🟢 LONG ENTRY SIGNAL — {emoji} {asset_name}</b>
-
-<b>Price:</b> ${price:,.2f}
-<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
-
-<b>All 6 Conditions Met:</b>
-{chr(10).join([f"  ✅ {k}" for k, v in conditions.items() if v])}
-
-<code>🚀 Consider LONG position
-📍 Stop loss below recent swing low
-🎯 Take profit at 2:1 risk/reward</code>"""
-    
-    return message
-
-def build_short_message(asset_name, emoji, price, conditions):
-    """Build short signal message"""
-    message = f"""<b>🔴 SHORT ENTRY SIGNAL — {emoji} {asset_name}</b>
-
-<b>Price:</b> ${price:,.2f}
-<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
-
-<b>All 6 Conditions Met:</b>
-{chr(10).join([f"  ✅ {k}" for k, v in conditions.items() if v])}
-
-<code>📉 Consider SHORT position
-📍 Stop loss above recent swing high
-🎯 Take profit at 2:1 risk/reward</code>"""
-    
-    return message
-
-# ============ MAIN FUNCTION ============
+# ============ MAIN ============
 def main():
     log.info("=" * 60)
-    log.info("📊 TRADING SIGNAL BOT - LONG & SHORT SIGNALS")
+    log.info("📊 SIGNAL BOT ACTIVE - Monitoring 4 assets")
     log.info("=" * 60)
-    log.info(f"Monitoring: {', '.join(ASSETS.keys())}")
-    log.info("Symbols: GC=F (Gold), CL=F (Oil), BTC-USD, ETH-USD")
-    log.info("=" * 60)
-    
-    signals_sent = 0
     
     for name, asset_config in ASSETS.items():
-        log.info(f"\n🔍 Analyzing {name} ({asset_config['symbol']})...")
-        
-        # Get data for all timeframes
         prices_h4, prices_h1, prices_m5 = get_asset_data(name, asset_config)
         
         if prices_h4 is None or len(prices_h4) < 10:
-            log.warning(f"⚠️ {name} - Insufficient H4 data")
+            log.warning(f"⚠️ {name} - insufficient data")
             continue
         
-        if prices_h1 is None or len(prices_h1) < 20:
-            log.warning(f"⚠️ {name} - Insufficient H1 data")
-            continue
-        
-        if prices_m5 is None or len(prices_m5) < 30:
-            log.warning(f"⚠️ {name} - Insufficient M5 data")
-            continue
-        
-        # Check all conditions
         result = check_conditions(prices_h4, prices_h1, prices_m5)
-        current_price = result.get("price", 0)
+        price = result["price"]
         
-        if current_price > 0:
-            log.info(f"💰 Current Price: ${current_price:,.2f}")
-        
-        # Check for LONG signal
-        if result["long"]:
-            log.info(f"🟢 LONG signal detected for {name}!")
-            
+        # Check LONG signal
+        if result["long"] and price > 0:
             if not check_cooldown(f"{name}_LONG"):
-                message = build_long_message(name, asset_config["emoji"], current_price, result["long_details"])
-                if send_telegram(message):
+                if send_signal(name, asset_config["emoji"], "LONG", price):
                     save_cooldown(f"{name}_LONG")
-                    signals_sent += 1
-                    log.info(f"✅ LONG signal sent for {name}")
-            else:
-                log.info(f"⏰ {name} LONG - cooldown active")
         
-        # Check for SHORT signal
-        if result["short"]:
-            log.info(f"🔴 SHORT signal detected for {name}!")
-            
+        # Check SHORT signal
+        if result["short"] and price > 0:
             if not check_cooldown(f"{name}_SHORT"):
-                message = build_short_message(name, asset_config["emoji"], current_price, result["short_details"])
-                if send_telegram(message):
+                if send_signal(name, asset_config["emoji"], "SHORT", price):
                     save_cooldown(f"{name}_SHORT")
-                    signals_sent += 1
-                    log.info(f"✅ SHORT signal sent for {name}")
-            else:
-                log.info(f"⏰ {name} SHORT - cooldown active")
         
-        # Small delay between assets
         time.sleep(2)
     
-    log.info(f"\n✅ Cycle complete. Sent {signals_sent} signal(s).")
-    log.info("=" * 60)
+    log.info(f"✅ Cycle complete - {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
 
 if __name__ == "__main__":
     main()
