@@ -1,6 +1,7 @@
 """
 Telegram Signal Bot - Long & Short Signals
-WORKING SYMBOLS: GC=F (Gold), CL=F (Crude Oil), BTC-USD, ETH-USD
+WORKING SYMBOLS: GC=F (Gold), CL=F (Oil), BTC-USD, ETH-USD
+Fixed yfinance compatibility issue
 """
 
 import os
@@ -26,26 +27,22 @@ ASSETS = {
     "Gold (XAUUSD)": {
         "symbol": "GC=F",           # Gold futures - WORKING
         "alt_symbol": "GLD",        # Gold ETF - fallback
-        "emoji": "🥇",
-        "is_futures": True
+        "emoji": "🥇"
     },
     "Crude Oil WTI": {
         "symbol": "CL=F",           # WTI Crude futures - WORKING
         "alt_symbol": "USO",        # Oil ETF - fallback
-        "emoji": "🛢️",
-        "is_futures": True
+        "emoji": "🛢️"
     },
     "Bitcoin": {
         "symbol": "BTC-USD",        # Bitcoin - WORKING
         "alt_symbol": None,
-        "emoji": "₿",
-        "is_futures": False
+        "emoji": "₿"
     },
     "Ethereum": {
         "symbol": "ETH-USD",        # Ethereum - WORKING
         "alt_symbol": None,
-        "emoji": "Ξ",
-        "is_futures": False
+        "emoji": "Ξ"
     }
 }
 
@@ -69,12 +66,13 @@ def save_cooldown(asset):
     except:
         pass
 
-# ============ YAHOO FINANCE DATA FETCHING ============
+# ============ YAHOO FINANCE DATA FETCHING (FIXED) ============
 def fetch_data(symbol, interval, period="5d"):
-    """Fetch OHLCV data from Yahoo Finance"""
+    """Fetch OHLCV data from Yahoo Finance - NO progress parameter"""
     try:
         ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval, progress=False)
+        # Remove 'progress' parameter - it's not supported in new versions
+        df = ticker.history(period=period, interval=interval)
         
         if df is not None and not df.empty:
             return df
@@ -108,7 +106,7 @@ def fetch_with_fallback(asset_name, asset_config, interval, period="5d"):
 def get_asset_data(asset_name, asset_config):
     """Fetch all required timeframes for an asset"""
     try:
-        # Fetch H4 data (by resampling H1)
+        # Fetch H1 data for H4 resampling
         df_h1 = fetch_with_fallback(asset_name, asset_config, "1h", "60d")
         if df_h1 is None or df_h1.empty:
             log.warning(f"❌ {asset_name}: Cannot fetch H1 data")
@@ -118,12 +116,13 @@ def get_asset_data(asset_name, asset_config):
         
         # Resample to H4 (every 4 hours)
         num_h4 = len(prices_h1) // 4
-        if num_h4 < 50:
+        if num_h4 < 20:
             log.warning(f"⚠️ {asset_name}: Only {num_h4} H4 bars available")
+        
         prices_h4 = np.array([np.mean(prices_h1[i*4:(i+1)*4]) for i in range(num_h4)])
         
         # Fetch M5 data
-        df_m5 = fetch_with_fallback(asset_name, asset_config, "5m", "5d")
+        df_m5 = fetch_with_fallback(asset_name, asset_config, "5m", "2d")
         if df_m5 is None or df_m5.empty:
             log.warning(f"❌ {asset_name}: Cannot fetch M5 data")
             return None, None, None
@@ -193,26 +192,20 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
 def check_conditions(prices_h4, prices_h1, prices_m5):
     """Check all long and short conditions"""
     
-    if len(prices_h4) < 50:
+    if len(prices_h4) < 20:
         return {"long": False, "long_details": {}, "short": False, "short_details": {}, "price": 0}
     
-    # Get most recent values
+    # Get most recent values (use last closed bar)
     close_h4 = prices_h4[-2] if len(prices_h4) >= 2 else prices_h4[-1]
     close_h1 = prices_h1[-2] if len(prices_h1) >= 2 else prices_h1[-1]
     close_m5 = prices_m5[-2] if len(prices_m5) >= 2 else prices_m5[-1]
     current_price = close_m5
     
-    # Calculate EMAs (use shorter periods if not enough data)
-    ema_period = min(200, len(prices_h4) - 1)
-    ema200_h4 = calculate_ema(prices_h4, ema_period) if ema_period >= 20 else None
-    
-    ema_period = min(200, len(prices_h1) - 1)
-    ema200_h1 = calculate_ema(prices_h1, ema_period) if ema_period >= 20 else None
-    
-    ema_period = min(200, len(prices_m5) - 1)
-    ema200_m5 = calculate_ema(prices_m5, ema_period) if ema_period >= 20 else None
-    
-    ema9_m5 = calculate_ema(prices_m5, 9) if len(prices_m5) >= 10 else None
+    # Calculate EMAs (use available data)
+    ema200_h4 = calculate_ema(prices_h4, min(200, len(prices_h4) - 1))
+    ema200_h1 = calculate_ema(prices_h1, min(200, len(prices_h1) - 1))
+    ema200_m5 = calculate_ema(prices_m5, min(200, len(prices_m5) - 1))
+    ema9_m5 = calculate_ema(prices_m5, min(9, len(prices_m5) - 1)) if len(prices_m5) >= 10 else None
     
     # MACD calculation
     macd_line, signal_line = calculate_macd(prices_m5)
@@ -221,27 +214,15 @@ def check_conditions(prices_h4, prices_h1, prices_m5):
     long_conditions = {}
     short_conditions = {}
     
-    # Condition 1,2,3: Price vs EMA200
-    if ema200_h4:
-        long_conditions["H4 Price > EMA200"] = close_h4 > ema200_h4
-        short_conditions["H4 Price < EMA200"] = close_h4 < ema200_h4
-    else:
-        long_conditions["H4 Price > EMA200"] = False
-        short_conditions["H4 Price < EMA200"] = False
+    # Conditions 1-3: Price vs EMA200
+    long_conditions["H4 Price > EMA200"] = (close_h4 > ema200_h4) if ema200_h4 else False
+    short_conditions["H4 Price < EMA200"] = (close_h4 < ema200_h4) if ema200_h4 else False
     
-    if ema200_h1:
-        long_conditions["H1 Price > EMA200"] = close_h1 > ema200_h1
-        short_conditions["H1 Price < EMA200"] = close_h1 < ema200_h1
-    else:
-        long_conditions["H1 Price > EMA200"] = False
-        short_conditions["H1 Price < EMA200"] = False
+    long_conditions["H1 Price > EMA200"] = (close_h1 > ema200_h1) if ema200_h1 else False
+    short_conditions["H1 Price < EMA200"] = (close_h1 < ema200_h1) if ema200_h1 else False
     
-    if ema200_m5:
-        long_conditions["M5 Price > EMA200"] = close_m5 > ema200_m5
-        short_conditions["M5 Price < EMA200"] = close_m5 < ema200_m5
-    else:
-        long_conditions["M5 Price > EMA200"] = False
-        short_conditions["M5 Price < EMA200"] = False
+    long_conditions["M5 Price > EMA200"] = (close_m5 > ema200_m5) if ema200_m5 else False
+    short_conditions["M5 Price < EMA200"] = (close_m5 < ema200_m5) if ema200_m5 else False
     
     # Condition 4: EMA9 vs EMA200
     if ema9_m5 and ema200_m5:
@@ -356,16 +337,16 @@ def main():
         # Get data for all timeframes
         prices_h4, prices_h1, prices_m5 = get_asset_data(name, asset_config)
         
-        if prices_h4 is None or len(prices_h4) < 20:
-            log.warning(f"⚠️ {name} - Insufficient H4 data (need 20+ bars)")
+        if prices_h4 is None or len(prices_h4) < 10:
+            log.warning(f"⚠️ {name} - Insufficient H4 data")
             continue
         
-        if prices_h1 is None or len(prices_h1) < 50:
-            log.warning(f"⚠️ {name} - Insufficient H1 data (need 50+ bars)")
+        if prices_h1 is None or len(prices_h1) < 20:
+            log.warning(f"⚠️ {name} - Insufficient H1 data")
             continue
         
-        if prices_m5 is None or len(prices_m5) < 50:
-            log.warning(f"⚠️ {name} - Insufficient M5 data (need 50+ bars)")
+        if prices_m5 is None or len(prices_m5) < 30:
+            log.warning(f"⚠️ {name} - Insufficient M5 data")
             continue
         
         # Check all conditions
@@ -387,11 +368,6 @@ def main():
                     log.info(f"✅ LONG signal sent for {name}")
             else:
                 log.info(f"⏰ {name} LONG - cooldown active")
-        else:
-            # Log which conditions failed
-            failed = [k for k, v in result["long_details"].items() if not v]
-            if failed:
-                log.info(f"📊 {name} LONG - missing: {failed[0]}")
         
         # Check for SHORT signal
         if result["short"]:
@@ -405,13 +381,8 @@ def main():
                     log.info(f"✅ SHORT signal sent for {name}")
             else:
                 log.info(f"⏰ {name} SHORT - cooldown active")
-        else:
-            # Log which conditions failed
-            failed = [k for k, v in result["short_details"].items() if not v]
-            if failed:
-                log.info(f"📊 {name} SHORT - missing: {failed[0]}")
         
-        # Delay between assets to avoid rate limits
+        # Small delay between assets
         time.sleep(2)
     
     log.info(f"\n✅ Cycle complete. Sent {signals_sent} signal(s).")
