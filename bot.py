@@ -1,11 +1,6 @@
 """
 Telegram Signal Bot - 3-Condition Rules with Detailed Logging
-Shows exact values for each condition in logs
-
-LONG:  H4 > EMA200 + H1 > EMA200 + MACD cross below 0 (within last 5 minutes)
-SHORT: H4 < EMA200 + H1 < EMA200 + MACD cross above 0 (within last 5 minutes)
-
-Assets: Gold, Oil, BTC, ETH, Nasdaq (MNQ=F), S&P500 (MES=F)
+FIXED: No duplicate signals
 """
 
 import os
@@ -15,6 +10,7 @@ from datetime import datetime, timezone
 import time
 import numpy as np
 import yfinance as yf
+import json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -23,8 +19,10 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-COOLDOWN_FILE = "/tmp/last_signal.txt"
-SIGNAL_COOLDOWN = 3600  # 1 hour between signals
+# Use persistent file for cooldown tracking (prevents duplicates across runs)
+COOLDOWN_FILE = "/tmp/signal_tracker.json"
+SIGNAL_COOLDOWN = 3600  # 1 hour between same asset+signal
+MACD_CROSS_FILE = "/tmp/macd_cross_tracker.json"  # Track last cross per asset
 
 # ASSETS with Yahoo Finance symbols
 ASSETS = {
@@ -36,27 +34,60 @@ ASSETS = {
     "S&P 500": {"symbol": "MES=F", "alt_symbol": "ES=F", "emoji": "📈"}
 }
 
-# ============ COOLDOWN FUNCTIONS ============
-def check_cooldown(asset, signal_type):
-    key = f"{asset}_{signal_type}"
+# ============ PERSISTENT TRACKING (Prevents duplicates across runs) ============
+def load_tracker(file_path):
+    """Load tracker JSON file"""
     try:
-        with open(COOLDOWN_FILE, 'r') as f:
-            for line in f:
-                if line.startswith(f"{key}:"):
-                    last = float(line.split(':')[1])
-                    if (datetime.now(timezone.utc).timestamp() - last) < SIGNAL_COOLDOWN:
-                        return True
-    except:
-        pass
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_tracker(file_path, data):
+    """Save tracker JSON file"""
+    try:
+        with open(file_path, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.debug(f"Failed to save tracker: {e}")
+
+def check_signal_allowed(asset, signal_type, cross_time):
+    """Check if we should send this signal (prevents duplicates)"""
+    tracker = load_tracker(COOLDOWN_FILE)
+    key = f"{asset}_{signal_type}"
+    
+    now = datetime.now(timezone.utc).timestamp()
+    
+    # Check cooldown
+    if key in tracker:
+        last_time = tracker[key]
+        if (now - last_time) < SIGNAL_COOLDOWN:
+            return False, f"cooldown ({int((now - last_time)/60)} min remaining)"
+    
+    return True, "allowed"
+
+def save_signal_time(asset, signal_type):
+    """Save when signal was sent"""
+    tracker = load_tracker(COOLDOWN_FILE)
+    key = f"{asset}_{signal_type}"
+    tracker[key] = datetime.now(timezone.utc).timestamp()
+    save_tracker(COOLDOWN_FILE, tracker)
+
+def check_macd_cross_already_sent(asset, cross_type, cross_time_str):
+    """Prevent sending same MACD cross multiple times"""
+    tracker = load_tracker(MACD_CROSS_FILE)
+    key = f"{asset}_{cross_type}_cross"
+    
+    if key in tracker and tracker[key] == cross_time_str:
+        return True  # Already sent this exact cross
     return False
 
-def save_cooldown(asset, signal_type):
-    key = f"{asset}_{signal_type}"
-    try:
-        with open(COOLDOWN_FILE, 'a') as f:
-            f.write(f"{key}:{datetime.now(timezone.utc).timestamp()}\n")
-    except:
-        pass
+def save_macd_cross(asset, cross_type, cross_time_str):
+    """Record that this MACD cross was sent"""
+    tracker = load_tracker(MACD_CROSS_FILE)
+    key = f"{asset}_{cross_type}_cross"
+    tracker[key] = cross_time_str
+    save_tracker(MACD_CROSS_FILE, tracker)
 
 # ============ DATA FETCHING ============
 def fetch_data(symbol, interval, period="5d"):
@@ -85,7 +116,6 @@ def fetch_with_fallback(asset_name, asset_config, interval, period="5d"):
 
 def get_asset_data(asset_name, asset_config):
     try:
-        # Fetch H1 data for H4 resampling and price vs EMA200
         df_h1 = fetch_with_fallback(asset_name, asset_config, "1h", "60d")
         if df_h1 is None or df_h1.empty:
             return None, None, None
@@ -99,18 +129,20 @@ def get_asset_data(asset_name, asset_config):
         
         prices_h4 = np.array([np.mean(prices_h1[i*4:(i+1)*4]) for i in range(num_h4)])
         
-        # Fetch M5 data for MACD calculation (need enough for crossover detection)
-        df_m5 = fetch_with_fallback(asset_name, asset_config, "5m", "1d")  # 1 day of 5min data
+        # Fetch M5 data - get more for better MACD detection
+        df_m5 = fetch_with_fallback(asset_name, asset_config, "5m", "2d")
         if df_m5 is None or df_m5.empty:
             log.warning(f"⚠️ {asset_name}: Cannot fetch M5 data for MACD")
             return prices_h4, prices_h1, None
         
         prices_m5 = df_m5['Close'].values
+        # Also get timestamps for MACD cross tracking
+        timestamps_m5 = df_m5.index.tolist()
         
-        return prices_h4, prices_h1, prices_m5
+        return prices_h4, prices_h1, prices_m5, timestamps_m5
     except Exception as e:
         log.error(f"Error getting data for {asset_name}: {e}")
-        return None, None, None
+        return None, None, None, None
 
 # ============ TECHNICAL INDICATORS ============
 def calculate_ema(prices, period):
@@ -134,7 +166,6 @@ def get_ema_series(prices, period):
     return ema_values
 
 def calculate_macd(prices, fast=12, slow=26, signal=9):
-    """Calculate MACD line and Signal line"""
     if len(prices) < slow + signal:
         return None, None
     ema_fast_values = get_ema_series(prices, fast)
@@ -147,108 +178,92 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
         return None, None
     return macd_line, signal_line
 
-# ============ SIGNAL CONDITIONS WITH DETAILED LOGGING ============
-def check_conditions(prices_h4, prices_h1, prices_m5, asset_name):
+# ============ SIGNAL CONDITIONS WITH DEDUPLICATION ============
+def check_conditions(prices_h4, prices_h1, prices_m5, timestamps_m5, asset_name):
     if len(prices_h4) < 5 or len(prices_h1) < 20:
         return {"long": False, "short": False, "price": 0, 
-                "long_details": {}, "short_details": {}}
+                "long_details": {}, "short_details": {},
+                "cross_time_str": None}
     
-    # Get most recent values (use last closed bar)
     close_h4 = prices_h4[-2] if len(prices_h4) >= 2 else prices_h4[-1]
     close_h1 = prices_h1[-2] if len(prices_h1) >= 2 else prices_h1[-1]
     current_price = close_h1
     
-    # Calculate EMAs on H4 and H1
     ema200_h4 = calculate_ema(prices_h4, min(200, len(prices_h4) - 1))
     ema200_h1 = calculate_ema(prices_h1, min(200, len(prices_h1) - 1))
     
-    # Calculate MACD on M5 data
-    macd_line = None
-    signal_line = None
-    macd_value = "Insufficient M5 data"
     cross_occurred = False
     cross_type = None
+    cross_time_str = None
+    macd_value = "Insufficient M5 data"
     
-    if prices_m5 is not None and len(prices_m5) >= 40:
+    if prices_m5 is not None and len(prices_m5) >= 40 and timestamps_m5:
         macd_line, signal_line = calculate_macd(prices_m5)
         
-        if macd_line and signal_line and len(macd_line) >= 3:
-            # Get last 3 bars to detect crossover
-            macd_prev = macd_line[-3]
-            macd_curr = macd_line[-2]
-            signal_prev = signal_line[-3]
-            signal_curr = signal_line[-2]
+        if macd_line and signal_line and len(macd_line) >= 5:
+            # Check last 5 bars for crossover to ensure we don't miss it
+            for i in range(-3, 0):
+                macd_prev = macd_line[i-1]
+                macd_curr = macd_line[i]
+                signal_prev = signal_line[i-1]
+                signal_curr = signal_line[i]
+                
+                if i >= -len(timestamps_m5):
+                    bar_time = timestamps_m5[i]
+                    bar_time_str = bar_time.strftime('%Y-%m-%d %H:%M')
+                    
+                    # LONG cross: MACD crosses ABOVE Signal (bullish)
+                    if macd_prev < signal_prev and macd_curr >= signal_curr:
+                        # Check if below zero for LONG signal
+                        if macd_curr <= 0 and signal_curr <= 0:
+                            cross_occurred = True
+                            cross_type = "LONG"
+                            cross_time_str = bar_time_str
+                            macd_value = f"MACD crossed ABOVE Signal at {bar_time_str} (below zero)"
+                            break
+                    
+                    # SHORT cross: MACD crosses BELOW Signal (bearish)
+                    elif macd_prev > signal_prev and macd_curr <= signal_curr:
+                        # Check if above zero for SHORT signal
+                        if macd_curr >= 0 and signal_curr >= 0:
+                            cross_occurred = True
+                            cross_type = "SHORT"
+                            cross_time_str = bar_time_str
+                            macd_value = f"MACD crossed BELOW Signal at {bar_time_str} (above zero)"
+                            break
             
-            # Check if MACD just crossed Signal (within last bar)
-            long_cross = (macd_prev < signal_prev and macd_curr >= signal_curr)
-            short_cross = (macd_prev > signal_prev and macd_curr <= signal_curr)
-            
-            # Check zero line conditions
-            long_below_zero = (macd_curr <= 0 and signal_curr <= 0)
-            short_above_zero = (macd_curr >= 0 and signal_curr >= 0)
-            
-            # Determine if a valid crossover occurred in the last bar
-            if long_cross and long_below_zero:
-                cross_occurred = True
-                cross_type = "LONG"
-                macd_value = f"MACD: ${macd_curr:.2f}, Signal: ${signal_curr:.2f} | Crossed BELOW zero in last 5min"
-            elif short_cross and short_above_zero:
-                cross_occurred = True
-                cross_type = "SHORT"
-                macd_value = f"MACD: ${macd_curr:.2f}, Signal: ${signal_curr:.2f} | Crossed ABOVE zero in last 5min"
-            else:
+            if not cross_occurred:
+                # Get latest values for display
+                macd_curr = macd_line[-2]
+                signal_curr = signal_line[-2]
                 macd_value = f"MACD: ${macd_curr:.2f}, Signal: ${signal_curr:.2f} | No recent crossover"
     
-    # ============ LONG CONDITIONS DETAILS ============
+    # LONG conditions
     long_details = {}
-    
-    # Condition 1: H4 Price > EMA200
-    if ema200_h4:
-        long_details["H4 Price > EMA200"] = {
-            "passed": close_h4 > ema200_h4,
-            "value": f"${close_h4:.2f} > ${ema200_h4:.2f}"
-        }
-    else:
-        long_details["H4 Price > EMA200"] = {"passed": False, "value": "Insufficient data"}
-    
-    # Condition 2: H1 Price > EMA200
-    if ema200_h1:
-        long_details["H1 Price > EMA200"] = {
-            "passed": close_h1 > ema200_h1,
-            "value": f"${close_h1:.2f} > ${ema200_h1:.2f}"
-        }
-    else:
-        long_details["H1 Price > EMA200"] = {"passed": False, "value": "Insufficient data"}
-    
-    # Condition 3: MACD cross below zero within last 5 minutes
-    long_details["MACD crossed below zero (last 5min)"] = {
+    long_details["H4 Price > EMA200"] = {
+        "passed": ema200_h4 and close_h4 > ema200_h4,
+        "value": f"${close_h4:.2f} > ${ema200_h4:.2f}" if ema200_h4 else "Insufficient data"
+    }
+    long_details["H1 Price > EMA200"] = {
+        "passed": ema200_h1 and close_h1 > ema200_h1,
+        "value": f"${close_h1:.2f} > ${ema200_h1:.2f}" if ema200_h1 else "Insufficient data"
+    }
+    long_details["MACD cross (bullish, below zero)"] = {
         "passed": cross_occurred and cross_type == "LONG",
         "value": macd_value
     }
     
-    # ============ SHORT CONDITIONS DETAILS ============
+    # SHORT conditions
     short_details = {}
-    
-    # Condition 1: H4 Price < EMA200
-    if ema200_h4:
-        short_details["H4 Price < EMA200"] = {
-            "passed": close_h4 < ema200_h4,
-            "value": f"${close_h4:.2f} < ${ema200_h4:.2f}"
-        }
-    else:
-        short_details["H4 Price < EMA200"] = {"passed": False, "value": "Insufficient data"}
-    
-    # Condition 2: H1 Price < EMA200
-    if ema200_h1:
-        short_details["H1 Price < EMA200"] = {
-            "passed": close_h1 < ema200_h1,
-            "value": f"${close_h1:.2f} < ${ema200_h1:.2f}"
-        }
-    else:
-        short_details["H1 Price < EMA200"] = {"passed": False, "value": "Insufficient data"}
-    
-    # Condition 3: MACD cross above zero within last 5 minutes
-    short_details["MACD crossed above zero (last 5min)"] = {
+    short_details["H4 Price < EMA200"] = {
+        "passed": ema200_h4 and close_h4 < ema200_h4,
+        "value": f"${close_h4:.2f} < ${ema200_h4:.2f}" if ema200_h4 else "Insufficient data"
+    }
+    short_details["H1 Price < EMA200"] = {
+        "passed": ema200_h1 and close_h1 < ema200_h1,
+        "value": f"${close_h1:.2f} < ${ema200_h1:.2f}" if ema200_h1 else "Insufficient data"
+    }
+    short_details["MACD cross (bearish, above zero)"] = {
         "passed": cross_occurred and cross_type == "SHORT",
         "value": macd_value
     }
@@ -263,7 +278,8 @@ def check_conditions(prices_h4, prices_h1, prices_m5, asset_name):
         "long_details": long_details,
         "short_details": short_details,
         "cross_occurred": cross_occurred,
-        "cross_type": cross_type
+        "cross_type": cross_type,
+        "cross_time_str": cross_time_str
     }
 
 # ============ LOGGING FUNCTIONS ============
@@ -290,28 +306,17 @@ def log_short_conditions(asset_name, details, current_price):
     return passed_count == 3
 
 # ============ TELEGRAM ============
-def send_signal(asset_name, emoji, signal_type, price, details, cross_type):
-    # Get the conditions that passed
-    conditions_passed = []
-    for condition, data in details.items():
-        if data["passed"]:
-            # Simplify MACD message for Telegram
-            if "MACD" in condition:
-                conditions_passed.append(f"  ✅ MACD {cross_type} crossover confirmed")
-            else:
-                conditions_passed.append(f"  ✅ {condition}")
+def send_signal(asset_name, emoji, signal_type, price, cross_time_str):
+    """Send signal to Telegram - simplified to avoid duplicates"""
+    direction = "🟢 LONG" if signal_type == "LONG" else "🔴 SHORT"
     
-    conditions_text = "\n".join(conditions_passed)
-    
-    message = f"""<b>{'🟢' if signal_type == 'LONG' else '🔴'} {signal_type} SIGNAL — {emoji} {asset_name}</b>
+    message = f"""<b>{direction} SIGNAL — {emoji} {asset_name}</b>
 
 <b>Price:</b> ${price:,.2f}
 <b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+<b>Signal Type:</b> 3-Condition MACD Strategy
 
-<b>Conditions met (3/3):</b>
-{conditions_text}
-
-<code>{'🚀 Consider LONG position' if signal_type == 'LONG' else '📉 Consider SHORT position'}</code>"""
+<code>{'✅ All 3 conditions met for LONG entry' if signal_type == 'LONG' else '✅ All 3 conditions met for SHORT entry'}</code>"""
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -326,10 +331,10 @@ def send_signal(asset_name, emoji, signal_type, price, details, cross_type):
 # ============ MAIN ============
 def main():
     log.info("=" * 70)
-    log.info("📊 TRADING SIGNAL BOT - 5-MINUTE MACD CROSSOVER DETECTION")
+    log.info("📊 TRADING SIGNAL BOT - MACD CROSSOVER DETECTION")
     log.info("=" * 70)
-    log.info("LONG:  H4 > EMA200 + H1 > EMA200 + MACD crossed BELOW 0 (last 5min)")
-    log.info("SHORT: H4 < EMA200 + H1 < EMA200 + MACD crossed ABOVE 0 (last 5min)")
+    log.info("LONG:  H4 > EMA200 + H1 > EMA200 + MACD bullish cross (below zero)")
+    log.info("SHORT: H4 < EMA200 + H1 < EMA200 + MACD bearish cross (above zero)")
     log.info("=" * 70)
     log.info(f"Monitoring {len(ASSETS)} assets:")
     for name, config in ASSETS.items():
@@ -343,55 +348,61 @@ def main():
         log.info(f"🔍 Analyzing {name} ({asset_config['symbol']})...")
         log.info(f"{'='*50}")
         
-        prices_h4, prices_h1, prices_m5 = get_asset_data(name, asset_config)
+        result = get_asset_data(name, asset_config)
+        if result is None:
+            continue
+        
+        prices_h4, prices_h1, prices_m5, timestamps_m5 = result
         
         if prices_h4 is None or len(prices_h4) < 5:
-            log.warning(f"⚠️ {name} - Insufficient H4 data (got {len(prices_h4) if prices_h4 is not None else 0} bars)")
+            log.warning(f"⚠️ {name} - Insufficient H4 data")
             continue
         
         if prices_h1 is None or len(prices_h1) < 20:
-            log.warning(f"⚠️ {name} - Insufficient H1 data (got {len(prices_h1) if prices_h1 is not None else 0} bars)")
+            log.warning(f"⚠️ {name} - Insufficient H1 data")
             continue
         
-        if prices_m5 is None or len(prices_m5) < 40:
-            log.warning(f"⚠️ {name} - Insufficient M5 data for MACD crossover (got {len(prices_m5) if prices_m5 is not None else 0} bars)")
-            # Continue anyway, MACD will show as failed
+        conditions = check_conditions(prices_h4, prices_h1, prices_m5, timestamps_m5, name)
+        current_price = conditions.get("price", 0)
         
-        result = check_conditions(prices_h4, prices_h1, prices_m5, name)
-        current_price = result.get("price", 0)
+        # Display conditions
+        long_all_met = log_long_conditions(name, conditions["long_details"], current_price)
+        short_all_met = log_short_conditions(name, conditions["short_details"], current_price)
         
-        # Display LONG conditions with exact values
-        log.info("")
-        long_all_met = log_long_conditions(name, result["long_details"], current_price)
-        
-        # Display SHORT conditions with exact values
-        log.info("")
-        short_all_met = log_short_conditions(name, result["short_details"], current_price)
-        
-        # Send LONG signal if all conditions met
-        if long_all_met:
-            log.info(f"\n🟢🔔 LONG SIGNAL ACTIVE for {name}!")
-            if not check_cooldown(name, "LONG"):
-                if send_signal(name, asset_config["emoji"], "LONG", current_price, result["long_details"], "LONG"):
-                    save_cooldown(name, "LONG")
-                    signals_sent += 1
+        # Send LONG signal (with deduplication)
+        if long_all_met and conditions.get("cross_time_str"):
+            # Check if this exact MACD cross was already sent
+            if not check_macd_cross_already_sent(name, "LONG", conditions["cross_time_str"]):
+                allowed, reason = check_signal_allowed(name, "LONG", conditions["cross_time_str"])
+                if allowed:
+                    log.info(f"\n🟢🔔 SENDING LONG SIGNAL for {name}!")
+                    if send_signal(name, asset_config["emoji"], "LONG", current_price, conditions["cross_time_str"]):
+                        save_signal_time(name, "LONG")
+                        save_macd_cross(name, "LONG", conditions["cross_time_str"])
+                        signals_sent += 1
+                else:
+                    log.info(f"⏰ {name} LONG - {reason}")
             else:
-                log.info(f"⏰ {name} LONG - cooldown active (1 hour)")
+                log.info(f"🔄 {name} LONG - MACD cross already sent (duplicate prevented)")
         
-        # Send SHORT signal if all conditions met
-        if short_all_met:
-            log.info(f"\n🔴🔔 SHORT SIGNAL ACTIVE for {name}!")
-            if not check_cooldown(name, "SHORT"):
-                if send_signal(name, asset_config["emoji"], "SHORT", current_price, result["short_details"], "SHORT"):
-                    save_cooldown(name, "SHORT")
-                    signals_sent += 1
+        # Send SHORT signal (with deduplication)
+        if short_all_met and conditions.get("cross_time_str"):
+            if not check_macd_cross_already_sent(name, "SHORT", conditions["cross_time_str"]):
+                allowed, reason = check_signal_allowed(name, "SHORT", conditions["cross_time_str"])
+                if allowed:
+                    log.info(f"\n🔴🔔 SENDING SHORT SIGNAL for {name}!")
+                    if send_signal(name, asset_config["emoji"], "SHORT", current_price, conditions["cross_time_str"]):
+                        save_signal_time(name, "SHORT")
+                        save_macd_cross(name, "SHORT", conditions["cross_time_str"])
+                        signals_sent += 1
+                else:
+                    log.info(f"⏰ {name} SHORT - {reason}")
             else:
-                log.info(f"⏰ {name} SHORT - cooldown active (1 hour)")
+                log.info(f"🔄 {name} SHORT - MACD cross already sent (duplicate prevented)")
         
         if not long_all_met and not short_all_met:
             log.info(f"\n📊 {name} - No signal (conditions not met)")
         
-        # Delay between assets to avoid rate limits
         time.sleep(2)
     
     log.info(f"\n{'='*70}")
